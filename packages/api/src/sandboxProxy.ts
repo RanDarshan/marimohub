@@ -20,7 +20,6 @@ import {
 	UnavailableError,
 	verifyProxyToken,
 } from '@marimo-hub/core';
-import type { ResourceSecurityLabels } from '@marimo-hub/core';
 import type { ApiDeps, HonoEnv } from './context';
 import { errorMetadataChain, logEvent } from './log';
 import { assertSessionPreviewActive, authorizationService, fail } from './shared';
@@ -164,10 +163,18 @@ export async function authorizeProxyRequest(
 		};
 	}
 
-	// Per-session authorization follows below once the project is loaded.
+	const projectRead = deps.services.projects.getProject(projectId);
+	// Handle notebook failures even when a project failure returns before this read settles.
+	const notebookRead = (async () => {
+		await assertSessionPreviewActive(deps, projectId, session);
+		return deps.services.notebooks.getSecurityLabels(projectId, sessionResourceNotebookId(session));
+	})().then(
+		(value) => ({ status: 'fulfilled' as const, value }),
+		(reason: unknown) => ({ status: 'rejected' as const, reason }),
+	);
 	let project;
 	try {
-		project = await deps.services.projects.getProject(projectId);
+		project = await projectRead;
 	} catch {
 		// A session whose project is gone is unreachable, like a missing session.
 		return { kind: 'reject', status: 404, code: 'NOT_FOUND', message: 'Session not found' };
@@ -176,15 +183,9 @@ export async function authorizeProxyRequest(
 	// satisfies the project labels but not the override must not reach the
 	// kernel. A missing notebook masks; a transient meta failure fails closed as
 	// unavailable rather than pretending the session is gone.
-	let notebookLabels: ResourceSecurityLabels | null;
-	try {
-		await assertSessionPreviewActive(deps, projectId, session);
-		notebookLabels = await deps.services.notebooks.getSecurityLabels(
-			projectId,
-			sessionResourceNotebookId(session),
-		);
-	} catch (err) {
-		if (err instanceof NotFoundError) {
+	const notebookResult = await notebookRead;
+	if (notebookResult.status === 'rejected') {
+		if (notebookResult.reason instanceof NotFoundError) {
 			return { kind: 'reject', status: 404, code: 'NOT_FOUND', message: 'Session not found' };
 		}
 		return {
@@ -194,6 +195,7 @@ export async function authorizeProxyRequest(
 			message: 'Session authorization could not be verified',
 		};
 	}
+	const notebookLabels = notebookResult.value;
 	// ONE decision covers the whole gate: lifecycle (a soft-deleted project's
 	// kernels go dark immediately — this is the only thing in the
 	// browser→kernel path, and the sandbox may still be alive), session
