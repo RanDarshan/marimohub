@@ -118,7 +118,7 @@ describe('createFromEnv auth backend selection', () => {
 			MARIMOHUB_AUTH_BACKEND: 'dev',
 			MARIMOHUB_COMPUTE_BACKEND: 'docker',
 			MARIMOHUB_COMPUTE_PROFILES: 'editing:cpu=2;mem=4Gi',
-			MARIMOHUB_APP_COMPUTE_PROFILES: 'app:cpu=1;mem=2Gi,large:cpu=4',
+			MARIMOHUB_COMPUTE_APP_PROFILES: 'app:cpu=1;mem=2Gi,large:cpu=4',
 		});
 		expect(deps.sandbox).toMatchObject({
 			computeProfile: 'editing',
@@ -133,10 +133,10 @@ describe('createFromEnv auth backend selection', () => {
 		expect(() =>
 			createFromEnv({
 				...baseEnv,
-				MARIMOHUB_APP_COMPUTE_PROFILES: 'app:cpu=nope',
+				MARIMOHUB_COMPUTE_APP_PROFILES: 'app:cpu=nope',
 				MARIMOHUB_AUTH_BACKEND: 'dev',
 			}),
-		).toThrow('MARIMOHUB_APP_COMPUTE_PROFILES');
+		).toThrow('MARIMOHUB_COMPUTE_APP_PROFILES');
 	});
 	it.each([undefined, ''])('leaves the app list unset for shared profiles: %s', (value) => {
 		const deps = createFromEnv({
@@ -144,7 +144,7 @@ describe('createFromEnv auth backend selection', () => {
 			MARIMOHUB_AUTH_BACKEND: 'dev',
 			MARIMOHUB_COMPUTE_BACKEND: 'docker',
 			MARIMOHUB_COMPUTE_PROFILES: 'editing:cpu=2',
-			MARIMOHUB_APP_COMPUTE_PROFILES: value,
+			MARIMOHUB_COMPUTE_APP_PROFILES: value,
 		});
 		expect(deps.sandbox.appComputeProfiles).toBeUndefined();
 	});
@@ -839,7 +839,7 @@ describe('createFromEnv oidc login-policy library', () => {
 		const deps = createFromEnv(loginPolicyEnv, undefined, { libraries: { oidcLoginPolicy } });
 		expect(deps.authenticator).toBeDefined();
 		expect(deps.authRoutes).toBeDefined();
-		expect(deps.policy.groups_carried).toBe(true);
+		expect(deps.policy.groupsCarried).toBe(true);
 		await expect(
 			deps.policyAnalyzer?.loginPolicy?.evaluate({
 				identity: { id: ACTOR, email: 'actor@example.com' },
@@ -896,7 +896,7 @@ describe('createFromEnv oidc email-domain allowlist', () => {
 				MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS: '*',
 				...extra,
 			});
-			expect(deps.policy.groups_carried).toBe(expected);
+			expect(deps.policy.groupsCarried).toBe(expected);
 		},
 	);
 

@@ -103,7 +103,11 @@ export type {
 	UpdateSyncedNotebookSourceInput,
 } from '../integrations/syncedSource';
 export { claimInviteRows, ProjectService } from './content/ProjectService';
-export type { ClaimedInviteRows, InviteIdentityResolver } from './content/ProjectService';
+export type {
+	ClaimedInviteRows,
+	InviteIdentityResolver,
+	NewMember,
+} from './content/ProjectService';
 export {
 	MAX_PROJECT_ALERT_DESTINATIONS,
 	ProjectAlertConfigSchema,
@@ -311,7 +315,6 @@ export type {
 	AuthorizationResource,
 	AuthorizationSubject,
 	NotebookLabelOverride,
-	ProjectEntryVisibilityInput,
 	ResourceSecurityPolicy,
 	SessionAdmissionRecord,
 } from './authorization/AuthorizationService';
@@ -344,7 +347,11 @@ export type { PersistenceMode } from './runtime/sessionPersistence';
 export * from './runtime/sandboxEnvironment';
 export { kernelBasePathFromUrl, localKernelBasePath } from './runtime/sandboxExposure';
 export { resolveBaseImage } from './runtime/resolveBaseImage';
-export { resolveComputeProfile, toComputeResourceRecord } from './runtime/resolveComputeProfile';
+export {
+	resolveComputeProfile,
+	storedComputeProfile,
+	toComputeResourceRecord,
+} from './runtime/resolveComputeProfile';
 export type { ComputeProfileConfig, ResolvedComputeProfile } from './runtime/resolveComputeProfile';
 export { resolveLaunchStrategyForSession } from './runtime/launchStrategy';
 export type { ResolvedLaunchStrategy } from './runtime/launchStrategy';

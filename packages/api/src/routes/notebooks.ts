@@ -68,6 +68,7 @@ import { assertPullSourceSupported, pullSourceToHead, resolveSyncTarget } from '
 import type { HonoEnv } from '../context';
 import { NotebookListQuery, pageSchema, paginate, PaginationQuery } from '../pagination';
 import { deleteNotebookAndRetire } from './notebookDelete';
+import { TagsBodySchema } from '../tagNamespace';
 
 // --- Request body schemas ---
 
@@ -75,16 +76,13 @@ const CreateNotebookBody = z.object({
 	title: z.string().min(1).openapi({ example: 'Revenue Analysis' }),
 	description: z.string().openapi({ example: 'Monthly revenue breakdown' }),
 	code: z.string().openapi({ example: 'import marimo as mo' }),
-	tags: z
-		.array(z.string())
-		.optional()
-		.openapi({ example: ['finance'] }),
+	tags: TagsBodySchema.optional().openapi({ example: ['finance'] }),
 	readme: z.string().optional(),
 	deps: z.string().optional(),
 	runtime: RuntimeResponseSchema.optional(),
 	base_image: BaseImageField.optional(),
 	compute_profile: ComputeProfileField.optional(),
-	app_compute_profile: ComputeProfileField.nullable().optional(),
+	app_compute_profile: ComputeProfileField.optional(),
 });
 
 const CreateGitNotebookBody = z.object({
@@ -101,15 +99,12 @@ const CreateGitNotebookBody = z.object({
 	// Repo subdirectory whose tree is mirrored; `entry_notebook` is relative to it.
 	root_path: z.string().optional().openapi({ example: 'apps' }),
 	entry_notebook: z.string().min(1).openapi({ example: 'my_app.py' }),
-	tags: z
-		.array(z.string())
-		.optional()
-		.openapi({ example: ['git'] }),
+	tags: TagsBodySchema.optional().openapi({ example: ['git'] }),
 	readme: z.string().optional(),
 	runtime: RuntimeResponseSchema.optional(),
 	base_image: z.string().min(1).optional(),
-	compute_profile: z.string().min(1).optional(),
-	app_compute_profile: ComputeProfileField.nullable().optional(),
+	compute_profile: ComputeProfileField.optional(),
+	app_compute_profile: ComputeProfileField.optional(),
 	sync_mode: z.enum(['push', 'pull']).optional().default('push'),
 });
 
@@ -144,7 +139,7 @@ const UpdateNotebookBody = z.object({
 	title: z.string().min(1).optional(),
 	description: z.string().optional(),
 	code: z.string().optional(),
-	tags: z.array(z.string()).optional(),
+	tags: TagsBodySchema.optional(),
 	readme: z.string().optional(),
 	deps: z.string().optional(),
 	message: z.string().optional().openapi({ example: 'Add regional breakdown' }),
@@ -1232,14 +1227,11 @@ app.openapi(createNotebook, async (c) => {
 		// returns the cached notebook even if the image list changed since.
 		const base_image = checkBaseImage(deps.sandbox.images, body.base_image) ?? undefined;
 		const compute_profile = checkComputeProfile(deps.sandbox, body.compute_profile) ?? undefined;
+		const app_compute_profile =
+			checkComputeProfile(deps.sandbox, body.app_compute_profile, 'app') ?? undefined;
 		const meta = await notebooks.createNotebook(
 			pid,
-			{
-				...body,
-				base_image,
-				compute_profile,
-				app_compute_profile: checkComputeProfile(deps.sandbox, body.app_compute_profile, 'app'),
-			},
+			{ ...body, base_image, compute_profile, app_compute_profile },
 			user.id,
 		);
 		return toPublicNotebookMeta(meta);
@@ -1256,12 +1248,9 @@ app.openapi(createGitNotebook, async (c) => {
 	const body = c.req.valid('json');
 	const base_image = checkBaseImage(deps.sandbox.images, body.base_image) ?? undefined;
 	const compute_profile = checkComputeProfile(deps.sandbox, body.compute_profile) ?? undefined;
-	const input = {
-		...body,
-		base_image,
-		compute_profile,
-		app_compute_profile: checkComputeProfile(deps.sandbox, body.app_compute_profile, 'app'),
-	};
+	const app_compute_profile =
+		checkComputeProfile(deps.sandbox, body.app_compute_profile, 'app') ?? undefined;
+	const input = { ...body, base_image, compute_profile, app_compute_profile };
 	const prospectiveSource = createGitSource(input, deps.sourceControl?.repositoryHosts);
 	if (prospectiveSource.sync_mode === 'pull') {
 		assertPullSourceSupported(deps, prospectiveSource, pid);

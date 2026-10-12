@@ -629,15 +629,27 @@ const memberKeys = (projectId: string) => [
 	appKeys.all,
 ];
 
+export type MemberChoice =
+	| { user_id: string; email?: never; group?: never }
+	| { email: string; user_id?: never; group?: never }
+	| { group: string; user_id?: never; email?: never };
+
 export function useAddMember(projectId: string) {
 	return useApiMutation(
-		// Exactly one of user_id / email / group, enforced server-side (422).
-		(body: { user_id?: string; email?: string; group?: string; role: AssignableProjectRole }) =>
+		({ role, ...choice }: MemberChoice & { role: AssignableProjectRole }) =>
 			apiData(
-				apiClient.POST('/api/v1/projects/{pid}/members', {
-					params: { path: { pid: projectId } },
-					body,
-				}),
+				choice.group !== undefined
+					? apiClient.POST('/api/v1/projects/{pid}/group-members', {
+							params: { path: { pid: projectId } },
+							body: { group: choice.group, role },
+						})
+					: apiClient.POST('/api/v1/projects/{pid}/members', {
+							params: { path: { pid: projectId } },
+							body:
+								choice.user_id !== undefined
+									? { user_id: choice.user_id, role }
+									: { email: choice.email, role },
+						}),
 			),
 		() => memberKeys(projectId),
 	);
@@ -1500,7 +1512,7 @@ export function useCreateNotebook(projectId: string) {
 			code: string;
 			base_image?: string;
 			compute_profile?: string;
-			app_compute_profile?: string | null;
+			app_compute_profile?: string;
 		}) =>
 			apiData(
 				apiClient.POST('/api/v1/projects/{pid}/notebooks', {
@@ -1542,7 +1554,7 @@ export function useCreateSyncedNotebook(projectId: string) {
 			sync_mode?: 'push' | 'pull';
 			base_image?: string;
 			compute_profile?: string;
-			app_compute_profile?: string | null;
+			app_compute_profile?: string;
 		}) =>
 			apiData(
 				apiClient.POST('/api/v1/projects/{pid}/notebooks/git', {

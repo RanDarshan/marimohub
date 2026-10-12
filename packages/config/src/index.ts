@@ -646,8 +646,8 @@ export function createFromEnv(
 		env.MARIMOHUB_COMPUTE_PROFILE_OVERRIDE,
 	);
 	const appProfiles = parseComputeProfiles(
-		env.MARIMOHUB_APP_COMPUTE_PROFILES,
-		'MARIMOHUB_APP_COMPUTE_PROFILES',
+		env.MARIMOHUB_COMPUTE_APP_PROFILES,
+		'MARIMOHUB_COMPUTE_APP_PROFILES',
 	);
 	const appliedAppProfiles = profilesForBackend(
 		computeBackendValue,
@@ -684,7 +684,8 @@ export function createFromEnv(
 		appProfiles,
 		'none',
 		computeCapabilities,
-	)?.replaceAll('MARIMOHUB_COMPUTE_PROFILES', 'MARIMOHUB_APP_COMPUTE_PROFILES');
+		'MARIMOHUB_COMPUTE_APP_PROFILES',
+	);
 	if (
 		(profileNotice || appProfileNotice) &&
 		!warnedUnsupportedProfileBackends.has(computeBackendValue)
@@ -800,7 +801,7 @@ export function createFromEnv(
 		jobs: parseJobsConfig(env),
 		mcp,
 		policy: {
-			groups_carried:
+			groupsCarried:
 				authBackend(env) === 'oidc' &&
 				(oidcLoginPolicySelected(env) ||
 					(parseList(env.MARIMOHUB_AUTH_OIDC_MEMBERSHIP_GROUPS)?.length ?? 0) > 0 ||

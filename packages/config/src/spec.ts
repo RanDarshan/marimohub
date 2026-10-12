@@ -62,7 +62,7 @@ const AUTH_ALLOWED_EMAIL_DOMAINS: ConfigVar = {
 };
 
 const OIDC_MEMBERSHIP_DESCRIPTION =
-	'Requires MARIMOHUB_AUTH_OIDC_GROUPS_CLAIM. Selected groups enter signed, unencrypted browser sessions or authenticated subjects for external OIDC access tokens. Limits: 32 groups and 1280 UTF-8 JSON bytes. Overflow rejects browser login or external-token authentication. Matching project group memberships grant their assigned roles.';
+	'Requires `MARIMOHUB_AUTH_OIDC_GROUPS_CLAIM`. Selected groups enter signed, unencrypted browser sessions or authenticated subjects for external OIDC access tokens. Limits: 32 groups and 1280 UTF-8 JSON bytes. Overflow rejects browser login or external-token authentication. Matching project group memberships grant their assigned roles. See [group membership](./auth.md#group-membership).';
 
 // Shared by every managed-AI backend (Bedrock, OpenAI-compatible); the config
 // registry requires one definition per variable id.
@@ -402,6 +402,13 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						optIn: true,
 					},
 					{
+						id: 'MARIMOHUB_COMPUTE_APP_PROFILES',
+						name: 'App compute profiles',
+						description:
+							'Optional ordered app profiles, using the same format as MARIMOHUB_COMPUTE_PROFILES. Backends that support compute profiles use the first as the app default. Unset uses the shared profiles and notebook compute_profile. Notebook app overrides require MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors.',
+						optIn: true,
+					},
+					{
 						id: 'MARIMOHUB_COMPUTE_WARM_POOL_ENABLED',
 						name: 'Warm sandbox pools',
 						description:
@@ -430,13 +437,6 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 						name: 'Preview compute profile',
 						description:
 							'Default compute profile for notebook previews. Must name an available profile. Unset uses the deployment default.',
-						optIn: true,
-					},
-					{
-						id: 'MARIMOHUB_APP_COMPUTE_PROFILES',
-						name: 'App compute profiles',
-						description:
-							'Optional ordered app profiles, using the same format as MARIMOHUB_COMPUTE_PROFILES. Backends that support compute profiles use the first as the app default. Unset uses the shared profiles and notebook compute_profile. Notebook app overrides require MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors.',
 						optIn: true,
 					},
 					{
@@ -1363,14 +1363,14 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 					{
 						id: 'MARIMOHUB_AUTH_OIDC_MEMBERSHIP_GROUPS',
 						name: 'Membership groups',
-						description: `Comma-separated, case-sensitive exact group IDs to retain (at most 200). A standalone * selects all groups within the same limits. ${OIDC_MEMBERSHIP_DESCRIPTION}`,
+						description: `Comma-separated, case-sensitive exact group IDs to retain (at most 200). \`*\` as the only entry selects all groups within the same limits and cannot be combined with prefixes. ${OIDC_MEMBERSHIP_DESCRIPTION}`,
 						example: 'hub-team-data,hub-team-ml',
 						optIn: true,
 					},
 					{
 						id: 'MARIMOHUB_AUTH_OIDC_MEMBERSHIP_GROUP_PREFIXES',
 						name: 'Membership group prefixes',
-						description: `Comma-separated, case-sensitive literal group prefixes to retain (at most 20); * is not a wildcard here. ${OIDC_MEMBERSHIP_DESCRIPTION}`,
+						description: `Comma-separated, case-sensitive literal group prefixes to retain (at most 20); \`*\` is not a wildcard here. ${OIDC_MEMBERSHIP_DESCRIPTION}`,
 						example: 'hub-team-',
 						optIn: true,
 					},
