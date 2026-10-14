@@ -30,7 +30,7 @@ import type {
 } from '../../ports/sandbox';
 import type { NotebookService } from '../content/NotebookService';
 import { SandboxProvisioner } from './SandboxProvisioner';
-import type { BucketConfig, WorkspaceLoadStrategies } from './SandboxProvisioner';
+import type { BucketConfig, ProvisionOptions, WorkspaceLoadStrategies } from './SandboxProvisioner';
 import { KERNEL_AUTH_TOKEN_FILE } from './kernelAuth';
 import { sandboxContextPath } from './sandboxContext';
 
@@ -686,6 +686,213 @@ describe('SandboxProvisioner', () => {
 	});
 
 	describe('provision', () => {
+		async function overlayFixture(loaders?: WorkspaceLoadStrategies) {
+			const sandbox = makeFakeSandbox();
+			const bucketHandle = new MemoryBucket();
+			const nb = paths.project(projectId).notebook(notebookId);
+			const version = nb.version(createVersionId());
+			await bucketHandle.put(nb.workspaceFile('nb.py'), 'draft');
+			await bucketHandle.put(version.code, 'committed');
+			const provisioner = new SandboxProvisioner(fakeComputeFrom(sandbox.instance), loaders);
+			return {
+				...sandbox,
+				bucketHandle,
+				nb,
+				version,
+				provision: (overrides: Partial<ProvisionOptions> = {}) =>
+					provisioner.provision({
+						sandboxId,
+						projectId,
+						notebookId,
+						hostname: 'localhost',
+						bucket: bucketConfig,
+						bucketHandle,
+						workspaceLoadMode: 'copy-only',
+						workspaceOverlay: [{ path: 'nb.py', key: version.code }],
+						...overrides,
+					}),
+			};
+		}
+
+		it.each([false, true])(
+			'writes the committed notebook once in the copy-only batch (Git: %s)',
+			async (withGit) => {
+				const { calls, bucketHandle, nb, version, provision } = await overlayFixture();
+				await bucketHandle.put(nb.workspaceFile('data.csv'), 'data');
+				if (withGit) await bucketHandle.put(version.gitFile('HEAD'), 'ref: refs/heads/main');
+
+				const result = await provision(withGit ? { gitPrefix: version.gitPrefix } : {});
+
+				const notebookWrites = calls.writeFiles.filter((files) =>
+					files.some(({ path }) => path === `${MOUNT_PATH}/nb.py`),
+				);
+				expect(notebookWrites).toEqual([
+					[
+						{ path: `${MOUNT_PATH}/nb.py`, content: new TextEncoder().encode('committed') },
+						{ path: `${MOUNT_PATH}/data.csv`, content: new TextEncoder().encode('data') },
+					],
+				]);
+				expect(calls.mountBucket).toEqual([]);
+				expect(result.counters.files_objects).toBe(withGit ? 3 : 2);
+			},
+		);
+
+		it.each([undefined, false])(
+			'applies the overlay when an injected copy loader does not report it (%s)',
+			async (overlayApplied) => {
+				const load = vi.fn<WorkspaceLoadStrategies['copyOnly']['load']>(async (ctx) => {
+					await ctx.sandbox.writeFiles([{ path: `${ctx.mountPath}/nb.py`, content: 'draft' }]);
+					return { usedFallback: true, overlayApplied };
+				});
+				const { calls, provision } = await overlayFixture({
+					copyOnly: { load },
+					mountOrCopy: { load },
+				});
+
+				await provision();
+
+				expect(load).toHaveBeenCalledOnce();
+				expect(
+					calls.writeFiles.flat().filter(({ path }) => path === `${MOUNT_PATH}/nb.py`),
+				).toEqual([
+					{ path: `${MOUNT_PATH}/nb.py`, content: 'draft' },
+					{ path: `${MOUNT_PATH}/nb.py`, content: new TextEncoder().encode('committed') },
+				]);
+			},
+		);
+
+		it.each(['copy-only', 'mount-or-copy'] as const)(
+			'does not repeat an overlay applied by an injected %s loader',
+			async (workspaceLoadMode) => {
+				const load = vi.fn<WorkspaceLoadStrategies['copyOnly']['load']>(async (ctx) => {
+					expect(ctx.overlay).toHaveLength(1);
+					await ctx.sandbox.writeFiles([{ path: `${ctx.mountPath}/nb.py`, content: 'committed' }]);
+					return { usedFallback: true, overlayApplied: true };
+				});
+				const { calls, bucketHandle, provision } = await overlayFixture({
+					copyOnly: { load },
+					mountOrCopy: { load },
+				});
+				const get = vi.spyOn(bucketHandle, 'get');
+
+				await provision({ workspaceLoadMode });
+
+				expect(
+					calls.writeFiles.flat().filter(({ path }) => path === `${MOUNT_PATH}/nb.py`),
+				).toEqual([{ path: `${MOUNT_PATH}/nb.py`, content: 'committed' }]);
+				expect(get).not.toHaveBeenCalled();
+			},
+		);
+
+		it.each(['sandbox', 'bucket', 'mount failure'] as const)(
+			'merges the overlay when mount-or-copy falls back because of %s',
+			async (reason) => {
+				const { instance, calls, bucketHandle, nb, version, provision } = await overlayFixture();
+				await bucketHandle.put(nb.workspaceFile('data.csv'), 'data');
+				if (reason === 'sandbox') {
+					Object.defineProperty(instance, 'supportsBucketMount', { value: false });
+				}
+				const mount = vi.spyOn(instance, 'mountBucket');
+				if (reason === 'mount failure') mount.mockRejectedValue(new Error('mount unsupported'));
+				const get = vi.spyOn(bucketHandle, 'get');
+
+				await provision({
+					workspaceLoadMode: undefined,
+					bucket: { ...bucketConfig, mountable: reason !== 'bucket' },
+				});
+
+				expect(
+					calls.writeFiles.filter((files) =>
+						files.some(({ path }) => path === `${MOUNT_PATH}/nb.py`),
+					),
+				).toEqual([
+					[
+						{ path: `${MOUNT_PATH}/nb.py`, content: new TextEncoder().encode('committed') },
+						{ path: `${MOUNT_PATH}/data.csv`, content: new TextEncoder().encode('data') },
+					],
+				]);
+				expect(get).not.toHaveBeenCalledWith(nb.workspaceFile('nb.py'));
+				expect(get.mock.calls.filter(([key]) => key === version.code)).toHaveLength(1);
+				expect(mount).toHaveBeenCalledTimes(reason === 'mount failure' ? 1 : 0);
+			},
+		);
+
+		it('applies the overlay after a successful mount', async () => {
+			const { instance, calls, provision } = await overlayFixture();
+			const write = instance.writeFiles.bind(instance);
+			instance.writeFiles = async (files) => {
+				if (files.some(({ path }) => path === `${MOUNT_PATH}/nb.py`)) {
+					expect(calls.mountBucket).toHaveLength(1);
+				}
+				await write(files);
+			};
+
+			const result = await provision({ workspaceLoadMode: undefined });
+
+			expect(result.usedFallback).toBe(false);
+			expect(calls.writeFiles.flat().filter(({ path }) => path === `${MOUNT_PATH}/nb.py`)).toEqual([
+				{ path: `${MOUNT_PATH}/nb.py`, content: new TextEncoder().encode('committed') },
+			]);
+		});
+
+		it.each(['missing', 'write'] as const)(
+			'destroys the sandbox without launching when the app overlay fails (%s)',
+			async (failure) => {
+				const { instance, calls, bucketHandle, version, provision } = await overlayFixture();
+				if (failure === 'missing') await bucketHandle.delete(version.code);
+				const writeFiles = instance.writeFiles.bind(instance);
+				instance.writeFiles = async (files) => {
+					if (files.some(({ path }) => path === `${MOUNT_PATH}/nb.py`)) {
+						throw new Error('overlay write failed');
+					}
+					await writeFiles(files);
+				};
+
+				await expect(provision()).rejects.toMatchObject({
+					message: expect.stringContaining(
+						'Failed to start sandbox while restoring the notebook workspace',
+					),
+					cause: expect.objectContaining({
+						message:
+							failure === 'missing'
+								? `Workspace source ${version.code} not found`
+								: 'overlay write failed',
+					}),
+				});
+				expect(calls.startProcess).toEqual([]);
+				expect(calls.exec.some((command) => command.includes('uv sync'))).toBe(false);
+				expect(calls.destroy).toBe(1);
+			},
+		);
+
+		it.each([false, true])(
+			'preserves the overlay with a configured archive (present: %s)',
+			async (present) => {
+				const { instance, calls, bucketHandle, nb, version, provision } = await overlayFixture();
+				if (present)
+					await bucketHandle.put(version.workspaceArchive, new Uint8Array([80, 75, 3, 4]));
+				const get = vi.spyOn(bucketHandle, 'get');
+				const writeFiles = instance.writeFiles.bind(instance);
+				instance.writeFiles = async (files) => {
+					if (present && files.some(({ path }) => path === `${MOUNT_PATH}/nb.py`)) {
+						expect(calls.exec.some((command) => command.startsWith('python3 '))).toBe(true);
+					}
+					await writeFiles(files);
+				};
+
+				await provision({ workspaceArchive: version.workspaceArchive });
+
+				expect(
+					calls.writeFiles.flat().filter(({ path }) => path === `${MOUNT_PATH}/nb.py`),
+				).toEqual([
+					{ path: `${MOUNT_PATH}/nb.py`, content: new TextEncoder().encode('committed') },
+				]);
+				expect(get.mock.calls.filter(([key]) => key === version.code)).toHaveLength(1);
+				expect(get).not.toHaveBeenCalledWith(nb.workspaceFile('nb.py'));
+				expect(calls.startProcess).toHaveLength(1);
+			},
+		);
+
 		const provisionOptions = {
 			sandboxId,
 			projectId,
@@ -2178,13 +2385,11 @@ describe('SandboxProvisioner', () => {
 			expect(restored).toContain(`${MOUNT_PATH}/python/apps/app.py`);
 			expect(restored).toContain(`${MOUNT_PATH}/.git/HEAD`);
 			expect(result.counters).toMatchObject({ files_objects: 2 });
-			expect(calls.exec).toContainEqual(
-				expect.stringContaining("git config --global --add safe.directory '/workspace'"),
-			);
-			expect(calls.exec).toContainEqual(
-				expect.stringContaining(
-					"cd '/workspace' && git -c 'safe.directory=/workspace' sparse-checkout set --cone -- 'python/apps'",
-				),
+			const gitCommands = calls.exec.filter((command) => command.includes('safe.directory'));
+			expect(gitCommands).toHaveLength(1);
+			expect(gitCommands[0]).toContain("git config --global --add safe.directory '/workspace'\n");
+			expect(gitCommands[0]).toContain(
+				"cd '/workspace' && git -c 'safe.directory=/workspace' sparse-checkout set --cone -- 'python/apps'",
 			);
 			const sparseCheckout = calls.exec.findIndex((command) => command.includes('sparse-checkout'));
 			expect(calls.execOptions[sparseCheckout]?.timeout).toBe(60_000);

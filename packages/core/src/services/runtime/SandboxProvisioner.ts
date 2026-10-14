@@ -7,7 +7,7 @@ import type { NotebookBridgeRuntime } from '../../ports/notebookBridge';
 import type { Bucket } from '../../ports/bucket';
 import { MARIMO_PORT } from '../../constants';
 import { Millis } from '../../duration';
-import { NotFoundError, PythonEnvironmentSetupError, UnavailableError } from '../../errors';
+import { PythonEnvironmentSetupError, UnavailableError } from '../../errors';
 import type { NotebookId, ProjectId, SandboxId, UserId } from '../../ids';
 import { effectivePersistenceMode } from './sessionPersistence';
 import {
@@ -38,11 +38,12 @@ import { shellQuote } from './shell';
 import type { NotebookService } from '../content/NotebookService';
 import {
 	captureWorkspace,
+	loadWorkspaceOverlay,
 	readSessionArtifacts,
 	restoreWorkspace,
 	sharedWorkspaceListing,
 } from './sandboxFiles';
-import type { WorkspaceRestoreStats } from './sandboxFiles';
+import type { WorkspaceOverlay, WorkspaceRestoreStats } from './sandboxFiles';
 import { restorePackedWorkspace } from './packedWorkspaceRestore';
 import { sandboxWorkspaceLayout } from './workspaceLayout';
 import type { SandboxWorkspaceLayout } from './workspaceLayout';
@@ -281,8 +282,8 @@ export interface ProvisionOptions {
 	 * `versions/{vid}/workspace/` prefix instead.
 	 */
 	workspacePrefix?: string;
-	/** Trusted workspace-relative files copied from immutable bucket objects after workspace restore. */
-	workspaceOverlay?: { path: string; key: string }[];
+	/** Overrides workspace files. Object restores include these files in the first batch. */
+	workspaceOverlay?: WorkspaceOverlay;
 	/** Pull-source Git metadata restored into `<workdir>/.git`. */
 	gitPrefix?: string;
 	/**
@@ -489,6 +490,7 @@ async function withSandboxSpan<T>(
 }
 
 export interface WorkspaceLoadContext {
+	overlay?: WorkspaceOverlay;
 	sandbox: SandboxInstance;
 	projectId: ProjectId;
 	notebookId: NotebookId;
@@ -504,6 +506,8 @@ export interface WorkspaceLoadContext {
 export interface WorkspaceLoadResult {
 	/** Files were copied in (true) rather than bucket-mounted (false). */
 	usedFallback: boolean;
+	/** True when this load applies ctx.overlay. Otherwise the provisioner applies it afterward. */
+	overlayApplied?: boolean;
 	/** What the copy moved; absent when the workspace was mounted instead. */
 	stats?: WorkspaceRestoreStats;
 	archiveStatus?: 'used' | 'missing' | 'failed';
@@ -532,6 +536,7 @@ class CopyWorkspaceLoadStrategy implements WorkspaceLoadStrategy {
 		excludeRelativeRoots,
 		waitUntilReady,
 		prefetchBudget,
+		overlay,
 	}: WorkspaceLoadContext): Promise<WorkspaceLoadResult> {
 		if (!bucketHandle) {
 			throw provisionFailure(
@@ -541,11 +546,12 @@ class CopyWorkspaceLoadStrategy implements WorkspaceLoadStrategy {
 		}
 		try {
 			const stats = await restoreWorkspace(sandbox, bucketHandle, workspacePrefix, mountPath, {
+				overlay,
 				excludeRelativeRoots,
 				waitUntilReady,
 				prefetchBudget,
 			});
-			return { usedFallback: true, stats };
+			return { usedFallback: true, overlayApplied: true, stats };
 		} catch (err) {
 			throw provisionFailure('restoring the notebook workspace into the sandbox', err);
 		}
@@ -796,7 +802,9 @@ export class SandboxProvisioner {
 						options.workspacePrefix ?? nb.workspacePrefix,
 						waitUntilReady,
 					);
-					await this.applyWorkspaceOverlay(sandbox, options, mountPath);
+					if (!loaded.overlayApplied) {
+						await this.applyWorkspaceOverlay(sandbox, options, mountPath);
+					}
 					return loaded;
 				});
 				span.setAttributes({
@@ -945,14 +953,7 @@ export class SandboxProvisioner {
 		if (!overlay || overlay.length === 0) return;
 		const bucket = options.bucketHandle;
 		if (!bucket) throw new UnavailableError('Bucket access is required for workspace overlay');
-		const files = await Promise.all(
-			overlay.map(async ({ path, key }) => {
-				const object = await bucket.get(key);
-				if (!object) throw new NotFoundError(`Workspace source ${key} not found`);
-				return { path: `${mountPath}/${path}`, content: await object.bytes() };
-			}),
-		);
-		await sandbox.writeFiles(files);
+		await sandbox.writeFiles(await loadWorkspaceOverlay(bucket, mountPath, overlay));
 	}
 
 	private async ensureReachable(sandbox: SandboxInstance, sw: Stopwatch): Promise<void> {
@@ -986,8 +987,7 @@ export class SandboxProvisioner {
 		);
 		await waitUntilReady();
 		if (options.gitPrefix) {
-			await this.markGitWorkdirTrusted(sandbox, layout.gitRoot);
-			if (layout.rootPath) await this.configureSparseCheckout(sandbox, options, layout);
+			await this.configureGitWorkdir(sandbox, options, layout);
 		}
 		return loaded;
 	}
@@ -1050,29 +1050,26 @@ export class SandboxProvisioner {
 		return this.loadWorkspaceObjects(sandbox, options, layout, workspacePrefix, waitUntilReady);
 	}
 
-	private async markGitWorkdirTrusted(sandbox: SandboxInstance, workdir: string): Promise<void> {
-		// Restored `.git` is often a different uid than the kernel user (Modal).
-		await sandbox.exec(
-			`if command -v git >/dev/null 2>&1; then git config --global --add safe.directory ${shellQuote(workdir)}; fi`,
-		);
-	}
-
-	/**
-	 * Narrow the checkout to the mirrored subtree so `git status` in the session
-	 * is clean instead of reporting the rest of the repository as deleted.
-	 * Best-effort: proposal capture scopes its own diff to the subtree, so a
-	 * missing or old `git` only costs the cosmetic cleanliness.
-	 */
-	private async configureSparseCheckout(
+	private async configureGitWorkdir(
 		sandbox: SandboxInstance,
 		options: ProvisionOptions,
 		layout: SandboxWorkspaceLayout,
 	): Promise<void> {
-		const result = await sandbox.exec(
-			`if command -v git >/dev/null 2>&1; then cd ${shellQuote(layout.gitRoot)} && git -c ${shellQuote(`safe.directory=${layout.gitRoot}`)} sparse-checkout set --cone -- ${shellQuote(layout.rootPath)}; fi`,
-			{ timeout: GIT_SPARSE_CHECKOUT_TIMEOUT_MS },
-		);
-		if (result.success) return;
+		// Restored `.git` may have a different owner; sparse checkout keeps subtree status clean.
+		const commands = [
+			'if command -v git >/dev/null 2>&1; then',
+			`git config --global --add safe.directory ${shellQuote(layout.gitRoot)}`,
+		];
+		if (layout.rootPath) {
+			commands.push(
+				`cd ${shellQuote(layout.gitRoot)} && git -c ${shellQuote(`safe.directory=${layout.gitRoot}`)} sparse-checkout set --cone -- ${shellQuote(layout.rootPath)}`,
+			);
+		}
+		commands.push('fi');
+		const result = await sandbox.exec(commands.join('\n'), {
+			timeout: GIT_SPARSE_CHECKOUT_TIMEOUT_MS,
+		});
+		if (result.success || !layout.rootPath) return;
 		logOperationalError(
 			'git_sparse_checkout_failed',
 			{
@@ -1100,6 +1097,7 @@ export class SandboxProvisioner {
 				: this.workspaceLoadStrategies.mountOrCopy;
 		if (!strategy.supportsPrefetch) await waitUntilReady();
 		const load = strategy.load({
+			overlay: options.workspaceOverlay,
 			sandbox,
 			projectId: options.projectId,
 			notebookId: options.notebookId,
