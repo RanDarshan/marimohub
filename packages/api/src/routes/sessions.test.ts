@@ -42,6 +42,7 @@ import {
 	makeTestWif,
 } from '../testing';
 import type { TestWifOptions } from '../testing';
+import { makeFakeSnapshotCompute } from '../testing/snapshotCompute';
 
 const STRANGER = uid('user_stranger');
 const MANAGER = uid('user_manager');
@@ -380,6 +381,193 @@ describe('Session routes', () => {
 		}
 	});
 
+	it('reads an absent editor claim once before creating a session', async () => {
+		const api = createTestApi({ bucket, compute: makeFakeCompute() });
+		const readClaim = vi.spyOn(api.deps.services.sessions, 'getEditorClaim');
+
+		const session = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+
+		expect(session.status).toBe('running');
+		expect(readClaim).toHaveBeenCalledExactlyOnceWith(pid, nid);
+	});
+
+	it('rejects a session record whose workspace lease was lost before publication completed', async () => {
+		const compute = makeFakeCompute();
+		const create = vi.spyOn(compute, 'create');
+		const api = createTestApi({ bucket, compute });
+		const { sessions } = api.deps.services;
+		const createSession = sessions.createSession.bind(sessions);
+		vi.spyOn(sessions, 'createSession').mockImplementationOnce(async (input) => {
+			const session = await createSession(input);
+			await bucket.put(
+				paths.project(pid).notebook(nid).workspaceMutationClaim,
+				JSON.stringify({
+					holder: 'another-writer',
+					expires_at: new Date(Date.now() + Millis.minutes(2)).toISOString(),
+				}),
+			);
+			return session;
+		});
+
+		const error = await expectError(await api.request('POST', sessionsPath()), 409, 'CONFLICT');
+
+		expect(error.message).toBe('Workspace mutation lease was lost; retry the operation');
+		expect(create).not.toHaveBeenCalled();
+		expect(await sessions.listSessions(nid)).toMatchObject([{ status: 'failed' }]);
+	});
+
+	it.each([
+		'none',
+		'claim',
+		'notebook',
+		'project',
+		'both',
+		'notebook read',
+		'project read',
+	] as const)('overlaps running rechecks and handles %s failure', async (failure) => {
+		const { instance, calls } = makeFakeSandbox();
+		const api = createTestApi({ bucket, compute: fakeComputeFrom(instance) });
+		const { sessions, notebooks, projects } = api.deps.services;
+		let running = false;
+		const setRunning = sessions.setRunning.bind(sessions);
+		vi.spyOn(sessions, 'setRunning').mockImplementation(async (...args) => {
+			const session = await setRunning(...args);
+			running = true;
+			return session;
+		});
+		const started = new Set<string>();
+		const releaseClaim = Promise.withResolvers<void>();
+		const claimEditor = sessions.claimEditor.bind(sessions);
+		vi.spyOn(sessions, 'claimEditor').mockImplementation(async (...args) => {
+			if (!running) return claimEditor(...args);
+			started.add('claim');
+			await releaseClaim.promise;
+			if (failure === 'claim') {
+				return {
+					claimed: false,
+					claim: {
+						session_id: makeSession().session_id,
+						sharing: 'shared',
+						claimed_at: new Date().toISOString(),
+					},
+				};
+			}
+			return claimEditor(...args);
+		});
+		const getMeta = notebooks.getNotebookMeta.bind(notebooks);
+		vi.spyOn(notebooks, 'getNotebookMeta').mockImplementation(async (...args) => {
+			const meta = await getMeta(...args);
+			if (!running) return meta;
+			started.add('notebook');
+			if (failure === 'notebook read') throw new Error('notebook read failed');
+			return ['claim', 'notebook', 'both'].includes(failure)
+				? { ...meta, status: 'deleted' }
+				: meta;
+		});
+		const getProject = projects.getProject.bind(projects);
+		vi.spyOn(projects, 'getProject').mockImplementation(async (...args) => {
+			const project = await getProject(...args);
+			if (!running) return project;
+			started.add('project');
+			if (failure === 'project read') throw new Error('project read failed');
+			return ['claim', 'project', 'both'].includes(failure)
+				? { ...project, status: 'deleted' }
+				: project;
+		});
+		const getNotebook = notebooks.getNotebook.bind(notebooks);
+		vi.spyOn(notebooks, 'getNotebook').mockImplementation((...args) => {
+			expect(running).toBe(false);
+			return getNotebook(...args);
+		});
+
+		const pending = api.request('POST', sessionsPath());
+		try {
+			await vi.waitFor(() => expect(started).toEqual(new Set(['claim', 'notebook', 'project'])));
+		} finally {
+			releaseClaim.resolve();
+		}
+		const response = await pending;
+		if (failure === 'none') {
+			expect(await expectOk<ApiSession>(response)).toMatchObject({ status: 'running' });
+			expect(calls.destroy).toBe(0);
+		} else {
+			const claimLost = failure === 'claim';
+			const error = await expectError(
+				response,
+				claimLost ? 409 : 404,
+				claimLost ? 'CONFLICT' : 'NOT_FOUND',
+			);
+			expect(error.message).toBe(
+				claimLost
+					? 'The editor session changed. Retry shortly.'
+					: failure.startsWith('project')
+						? `Project ${pid} not found`
+						: `Notebook ${nid} not found`,
+			);
+			expect(calls.destroy).toBe(1);
+			expect(await sessions.listSessions(nid)).toMatchObject([
+				{
+					status: claimLost ? 'terminated' : 'failed',
+					sandbox_reclaimed_at: expect.any(String),
+				},
+			]);
+			expect((await sessions.getEditorClaim(pid, nid))?.session_id).toBeNull();
+		}
+	});
+
+	it.each([
+		{ deferred: true, fails: false },
+		{ deferred: true, fails: true },
+		{ deferred: false, fails: false },
+		{ deferred: false, fails: true },
+	])('handles a slow app audit store (%j)', async ({ deferred, fails }) => {
+		const tasks: Promise<unknown>[] = [];
+		const api = createTestApi({
+			bucket,
+			compute: makeFakeCompute(),
+			deps: {
+				backgroundTasks: deferred ? { defer: (task) => tasks.push(task) } : undefined,
+			},
+		});
+		const { events } = api.deps.services;
+		const append = events.append.bind(events);
+		const auditStarted = Promise.withResolvers<void>();
+		const releaseAudit = Promise.withResolvers<void>();
+		vi.spyOn(events, 'append').mockImplementation(async (event) => {
+			if (event.event === 'app.start') {
+				auditStarted.resolve();
+				await releaseAudit.promise;
+				if (fails) throw new Error('audit store unavailable');
+			}
+			return append(event);
+		});
+		const startedOn = new Date().toISOString().slice(0, 10);
+		let responded = false;
+		const pending = Promise.resolve(api.request('POST', sessionsPath(), { mode: 'app' })).then(
+			(response) => {
+				responded = true;
+				return response;
+			},
+		);
+		await auditStarted.promise;
+		try {
+			if (deferred) await vi.waitFor(() => expect(responded).toBe(true));
+			else expect(responded).toBe(false);
+			expect(tasks).toHaveLength(deferred ? 1 : 0);
+		} finally {
+			releaseAudit.resolve();
+			await Promise.all(tasks);
+		}
+		const session = await expectOk<ApiSession>(await pending);
+		expect(session.status).toBe('running');
+		const days = [...new Set([startedOn, new Date().toISOString().slice(0, 10)])];
+		const starts = (await Promise.all(days.map((day) => events.getEvents(day))))
+			.flat()
+			.filter((event) => event.event === 'app.start');
+		expect(starts).toHaveLength(fails ? 0 : 1);
+		if (!fails) expect(starts[0]).toMatchObject({ actor: ACTOR, session_id: session.session_id });
+	});
+
 	it('POST /sessions with a non-existent notebook returns 404 and does not provision', async () => {
 		// Use a notebook id that was never created in this project.
 		const bogusNid = createNotebookId();
@@ -389,6 +577,37 @@ describe('Session routes', () => {
 		// No session record should have been created.
 		const all = await createServices(bucket).sessions.listSessions(bogusNid);
 		expect(all).toHaveLength(0);
+	});
+
+	it('returns 403 for a caller without a role even when the notebook does not exist', async () => {
+		const compute = makeFakeCompute();
+		const create = vi.spyOn(compute, 'create');
+		const api = createTestApi({ bucket, userId: STRANGER, compute });
+		const bogusNid = createNotebookId();
+
+		await expectError(
+			await api.request('POST', `/projects/${pid}/notebooks/${bogusNid}/sessions`),
+			403,
+			'FORBIDDEN',
+		);
+		expect(create).not.toHaveBeenCalled();
+	});
+
+	it('consumes an early notebook read failure while project authorization is pending', async () => {
+		const api = createTestApi({ bucket, userId: STRANGER, compute: makeFakeCompute() });
+		const project = await api.deps.services.projects.getProject(pid);
+		const projectRead = Promise.withResolvers<typeof project>();
+		vi.spyOn(api.deps.services.projects, 'getProject').mockReturnValueOnce(projectRead.promise);
+		const notebookRead = vi
+			.spyOn(api.deps.services.notebooks, 'getNotebook')
+			.mockRejectedValueOnce(new Error('notebook storage unavailable'));
+		const pending = api.request('POST', sessionsPath());
+		try {
+			await vi.waitFor(() => expect(notebookRead).toHaveBeenCalledOnce());
+		} finally {
+			projectRead.resolve(project);
+		}
+		await expectError(await pending, 403, 'FORBIDDEN');
 	});
 
 	it('POST /sessions for an unsynced GitHub notebook returns 409 and does not provision', async () => {
@@ -405,10 +624,63 @@ describe('Session routes', () => {
 			ACTOR,
 		);
 		const path = `/projects/${pid}/notebooks/${meta.id}/sessions`;
+		const compute = makeFakeCompute();
+		const create = vi.spyOn(compute, 'create');
+		const api = createTestApi({ bucket, compute, deps: { services } });
+		const scan = vi.spyOn(services.sessions, 'findReusableEditor');
 
-		await expectError(await owner('POST', path), 409, 'CONFLICT');
+		const error = await expectError(await api.request('POST', path), 409, 'CONFLICT');
+		expect(error.message).toBe('Synced notebook has not been synced yet');
+		expect(scan).not.toHaveBeenCalled();
+		expect(create).not.toHaveBeenCalled();
 		expect(await services.sessions.listSessions(meta.id)).toHaveLength(0);
 	});
+
+	it('preserves surface validation errors when speculative session reads fail', async () => {
+		const compute = makeFakeSnapshotCompute();
+		const api = createTestApi({ bucket, compute });
+		const reuse = vi
+			.spyOn(api.deps.services.sessions, 'findReusableEditor')
+			.mockRejectedValueOnce(new Error('session scan unavailable'));
+		const snapshot = vi
+			.spyOn(api.deps.services.notebooks, 'getFsSnapshot')
+			.mockRejectedValueOnce(new Error('snapshot storage unavailable'));
+
+		await expectError(
+			await api.request('POST', sessionsPath(), { surfaces: ['vscode'] }),
+			409,
+			'SURFACE_NOT_ENABLED',
+		);
+		expect(reuse).toHaveBeenCalledOnce();
+		expect(snapshot).toHaveBeenCalledOnce();
+		expect(await api.deps.services.sessions.listSessions(nid)).toHaveLength(0);
+	});
+
+	it.each(['reuse', 'snapshot'] as const)(
+		'fails before provisioning when the speculative %s read rejects',
+		async (failure) => {
+			const compute = makeFakeSnapshotCompute();
+			const create = vi.spyOn(compute, 'create');
+			const api = createTestApi({ bucket, compute });
+			const { sessions, notebooks } = api.deps.services;
+			const error = new ConflictError(`${failure} read failed`);
+			if (failure === 'reuse') {
+				vi.spyOn(sessions, 'findReusableEditor').mockRejectedValueOnce(error);
+			} else {
+				vi.spyOn(notebooks, 'getFsSnapshot').mockRejectedValueOnce(error);
+			}
+
+			const response = await expectError(
+				await api.request('POST', sessionsPath()),
+				409,
+				'CONFLICT',
+			);
+
+			expect(response.message).toBe(error.message);
+			expect(create).not.toHaveBeenCalled();
+			expect(await sessions.listSessions(nid)).toHaveLength(0);
+		},
+	);
 
 	describe('launch strategy inference', () => {
 		const enc = (s: string) => new TextEncoder().encode(s);
@@ -996,29 +1268,54 @@ describe('Session routes', () => {
 			captured_at: '2026-07-01T00:00:00.000Z',
 			owner_user_id: STRANGER,
 		});
-		const { instance } = makeFakeSandbox();
-		const restored: string[] = [];
-		const compute = {
-			...fakeComputeFrom(instance),
-			filesystemSnapshotsEnabled: true,
-			createFromSnapshot(_id: string, snapshotId: string) {
-				restored.push(snapshotId);
-				return instance;
-			},
-			async captureSnapshot() {
-				return { snapshotId: 'unused' };
-			},
-			async deleteSnapshot() {},
-		};
+		const compute = makeFakeSnapshotCompute();
 		const exclusiveOther = exclusiveApi(STRANGER, compute);
 
 		const data = await expectOk<ApiSession>(
 			await exclusiveOther('POST', sessionsPath(), { edit_intent: 'temporary' }),
 		);
 		expect(data.ephemeral).toBe(true);
-		expect(restored).toEqual([]);
+		expect(compute.createFromSnapshot).not.toHaveBeenCalled();
 		expect(data.compute_from_snapshot).toBeUndefined();
 	});
+
+	it.each(['running', 'reclaimed'] as const)(
+		'allows startup when a requested takeover expires during the scan of a %s holder',
+		async (holderState) => {
+			const request = exclusiveApi(ACTOR);
+			const persistent = await expectOk<ApiSession>(await request('POST', sessionsPath()));
+			const { sessions } = createServices(bucket);
+			const claim = await sessions.reserveTakeover(pid, nid, {
+				takeoverId: 'scan-expiry',
+				requestedBy: STRANGER,
+				expectedHolder: persistent.session_id,
+				expectedActivity: 'idle',
+			});
+			if (holderState === 'reclaimed') {
+				await sessions.markTerminated(pid, persistent.session_id);
+				await sessions.markSandboxReclaimed(pid, persistent.session_id, new Date().toISOString());
+			}
+			vi.useFakeTimers({ toFake: ['Date'] });
+			const list = bucket.list.bind(bucket);
+			const scan = vi.spyOn(bucket, 'list').mockImplementation(async (options) => {
+				if (options?.prefix === paths.sessionsForProject(pid)) {
+					vi.setSystemTime(Date.parse(claim.transfer!.requested_at) + Millis.minutes(5));
+				}
+				return list(options);
+			});
+			try {
+				vi.setSystemTime(Date.parse(claim.transfer!.requested_at) + Millis.minutes(5) - 1);
+				const result = await expectOk<ApiSession>(await request('POST', sessionsPath()));
+				expect(result.status).toBe('running');
+				if (holderState === 'running') expect(result.session_id).toBe(persistent.session_id);
+				else expect(result.session_id).not.toBe(persistent.session_id);
+				expect((await sessions.getEditorClaim(pid, nid))?.transfer).toBeUndefined();
+			} finally {
+				scan.mockRestore();
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it('reports exclusive ownership and completes a warned takeover before replacement', async () => {
 		const ownerCompute = makeFakeCompute();
@@ -1773,6 +2070,39 @@ describe('Session routes', () => {
 		expect(compute.lastCreateOptions?.resources).toEqual({ cpu: 8 });
 	});
 
+	it.each([false, true])(
+		'restores the snapshot captured while retiring a dead editor (previous snapshot: %s)',
+		async (previousSnapshot) => {
+			const services = createServices(bucket);
+			if (previousSnapshot) {
+				await services.notebooks.setFsSnapshot(pid, nid, {
+					snapshot_id: 'snap-old',
+					captured_at: new Date().toISOString(),
+				});
+			}
+			const compute = makeFakeSnapshotCompute();
+			compute.captureSnapshot.mockResolvedValue({ snapshotId: 'snap-retired' });
+			const api = createTestApi({
+				bucket,
+				compute,
+				deps: { kernelProbe: async () => 'dead' },
+			});
+			const first = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+			compute.createFromSnapshot.mockClear();
+
+			const replacement = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+			const stored = await services.sessions.getSession(pid, replacement.session_id);
+
+			expect(replacement.session_id).not.toBe(first.session_id);
+			expect(replacement.compute_from_snapshot).toBe(true);
+			expect(compute.createFromSnapshot).toHaveBeenCalledExactlyOnceWith(
+				stored.sandbox_id,
+				'snap-retired',
+				expect.anything(),
+			);
+		},
+	);
+
 	it('reports the compute provenance restored from a filesystem snapshot', async () => {
 		const services = createServices(bucket);
 		await services.notebooks.updateNotebook(pid, nid, { compute_profile: 'large' }, ACTOR);
@@ -1782,20 +2112,7 @@ describe('Session routes', () => {
 			compute_profile: 'small',
 			compute_resources: { cpu: 1, memory_bytes: 2 * 1024 ** 3 },
 		});
-		const { instance } = makeFakeSandbox();
-		const restored: string[] = [];
-		const compute = {
-			...fakeComputeFrom(instance),
-			filesystemSnapshotsEnabled: true,
-			createFromSnapshot(_id: string, snapshotId: string) {
-				restored.push(snapshotId);
-				return instance;
-			},
-			async captureSnapshot() {
-				return { snapshotId: 'unused' };
-			},
-			async deleteSnapshot() {},
-		};
+		const compute = makeFakeSnapshotCompute();
 		const request = createTestApi({
 			bucket,
 			userId: ACTOR,
@@ -1812,7 +2129,11 @@ describe('Session routes', () => {
 		}).request;
 
 		const data = await expectOk<ApiSession>(await request('POST', sessionsPath()));
-		expect(restored).toEqual(['snap-old']);
+		expect(compute.createFromSnapshot).toHaveBeenCalledExactlyOnceWith(
+			expect.any(String),
+			'snap-old',
+			expect.anything(),
+		);
 		expect(data.compute_profile).toBe('small');
 		expect(data.compute_resources).toEqual({
 			cpu: 1,
@@ -2846,6 +3167,30 @@ describe('Session routes', () => {
 		});
 	});
 
+	it('does not probe or retire a reused editor when tightening authorization fails', async () => {
+		const first = await expectOk<ApiSession>(await owner('POST', sessionsPath()));
+		const { instance, calls } = makeFakeSandbox();
+		const probe = vi.fn(async () => 'dead' as const);
+		const api = createTestApi({
+			bucket,
+			compute: fakeComputeFrom(instance),
+			subject: { entitlementsExpiresAt: new Date(Date.now() + Millis.hours(1)).toISOString() },
+			deps: { kernelProbe: probe },
+		});
+		vi.spyOn(api.deps.services.sessions, 'tightenAuthorizationDeadline').mockRejectedValueOnce(
+			new ConflictError('authorization update failed'),
+		);
+
+		const error = await expectError(await api.request('POST', sessionsPath()), 409, 'CONFLICT');
+
+		expect(error.message).toBe('authorization update failed');
+		expect(probe).not.toHaveBeenCalled();
+		expect(calls.destroy).toBe(0);
+		expect(await api.deps.services.sessions.getSession(pid, first.session_id)).toMatchObject({
+			status: 'running',
+		});
+	});
+
 	it('rejects editor reuse when authorization expires during the kernel probe', async () => {
 		const services = createServices(bucket);
 		const kernelProbe = vi.fn<NonNullable<ApiDeps['kernelProbe']>>();
@@ -3030,11 +3375,12 @@ describe('Session routes', () => {
 
 		it('does not retire an edit session when the PAT omits session.stop', async () => {
 			const { instance, calls } = makeFakeSandbox();
+			const probe = vi.fn(async () => 'dead' as const);
 			const scoped = createTestApi({
 				bucket,
 				compute: fakeComputeFrom(instance),
 				deps: {
-					kernelProbe: async () => 'dead' as const,
+					kernelProbe: probe,
 					authenticator: {
 						authenticate: async () => ({
 							id: ACTOR,
@@ -3057,6 +3403,7 @@ describe('Session routes', () => {
 			expect(second.session_id).toBe(first.session_id);
 			expect(second.reused).toBe(true);
 			expect(calls.destroy).toBe(0);
+			expect(probe).not.toHaveBeenCalled();
 		});
 
 		it('resumes a healthy reused session without reprovisioning (probe alive)', async () => {

@@ -872,6 +872,7 @@ export class SessionService {
 		userId: UserId,
 		sharing: EditorSandboxSharing,
 		temporary: boolean,
+		known?: { claim: EditorClaim | undefined },
 	): Promise<{
 		session?: Session;
 		ownedByOther?: Session;
@@ -891,7 +892,7 @@ export class SessionService {
 					.sort((a, b) => b.last_heartbeat.localeCompare(a.last_heartbeat))[0],
 			};
 		}
-		const claim = await this.getEditorClaim(projectId, notebookId);
+		const claim = await this.resolveEditorClaim(projectId, notebookId, known);
 		if (!claim?.session_id) {
 			const persistent = live.filter((session) => !session.ephemeral);
 			if (persistent.length > 1) {
@@ -1060,6 +1061,16 @@ export class SessionService {
 		return claim;
 	}
 
+	private async resolveEditorClaim(
+		projectId: ProjectId,
+		notebookId: NotebookId,
+		known?: { claim: EditorClaim | undefined },
+	): Promise<EditorClaim | undefined> {
+		// Requested transfers can expire or enter draining while other reads run.
+		if (known && known.claim?.transfer?.phase !== 'requested') return known.claim;
+		return this.getEditorClaim(projectId, notebookId);
+	}
+
 	private editorClaimHolder(
 		claim: EditorClaim,
 		requestedBy?: UserId,
@@ -1076,8 +1087,9 @@ export class SessionService {
 		projectId: ProjectId,
 		notebookId: NotebookId,
 		requestedBy: UserId,
+		known?: { claim: EditorClaim | undefined },
 	): Promise<boolean> {
-		const claim = await this.getEditorClaim(projectId, notebookId);
+		const claim = await this.resolveEditorClaim(projectId, notebookId, known);
 		if (!claim) return false;
 		const holder = await this.getLiveEditorHolder(
 			projectId,

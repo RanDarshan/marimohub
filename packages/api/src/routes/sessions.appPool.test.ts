@@ -20,6 +20,7 @@ import type { MemoryBucket } from '@marimo-hub/core/testing';
 import { createInitializedBucket, createTestApi, expectError, expectOk } from '../testing';
 import { authorizeProxyRequest } from '../sandboxProxy';
 import { sweepAppPools } from '../appPools';
+import { makeFakeSnapshotCompute } from '../testing/snapshotCompute';
 
 describe('app pool HTTP integration', () => {
 	let bucket: MemoryBucket;
@@ -300,13 +301,7 @@ describe('app pool HTTP integration', () => {
 		async (replacement) => {
 			const selected = replacement ? await start() : undefined;
 			const fake = makeFakeSandbox();
-			const compute = {
-				...fakeComputeFrom(fake.instance),
-				filesystemSnapshotsEnabled: true,
-				createFromSnapshot: () => fake.instance,
-				captureSnapshot: async () => ({ snapshotId: 'unused' }),
-				deleteSnapshot: async () => {},
-			};
+			const compute = makeFakeSnapshotCompute(fake.instance);
 			const client = createTestApi({
 				bucket,
 				userId: uid('alice'),
@@ -321,20 +316,24 @@ describe('app pool HTTP integration', () => {
 			};
 			const pool = new AppPoolService(bucket, client.deps.services.sessions, policy);
 			let reservedSessionId: SessionId | undefined;
-			const get = bucket.get.bind(bucket);
-			const failure = vi.spyOn(bucket, 'get').mockImplementation(async (key) => {
-				if (key === paths.project(pid).notebook(nid).fsSnapshot) {
-					reservedSessionId = (await pool.store.read(pid, nid))?.members.find(
+			const put = bucket.put.bind(bucket);
+			const reservation = vi.spyOn(bucket, 'put').mockImplementation(async (...args) => {
+				const result = await put(...args);
+				if (args[0] === paths.appPool(pid, nid)) {
+					reservedSessionId ??= (await pool.store.read(pid, nid))?.members.find(
 						(member) => member.session_id !== selected?.session_id,
 					)?.session_id;
-					throw new Error('snapshot storage unavailable');
 				}
-				return get(key);
+				return result;
 			});
+			const failure = vi
+				.spyOn(client.deps.services.notebooks, 'getFsSnapshot')
+				.mockRejectedValue(new Error('snapshot storage unavailable'));
 			try {
 				expect((await client.request('POST', path(), body)).status).toBe(500);
 			} finally {
 				failure.mockRestore();
+				reservation.mockRestore();
 			}
 			const stored = await pool.store.read(pid, nid);
 			expect(reservedSessionId).toBeDefined();

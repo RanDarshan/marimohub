@@ -17,6 +17,7 @@ import type {
 	MarimoConfigContributor,
 	SessionEnv,
 	Session,
+	SessionAdmissionRecord,
 	SessionMode,
 	SandboxInstance,
 	SessionRender,
@@ -1270,17 +1271,13 @@ export async function startNotebookSession(input: {
 	if (body?.replace_app_session_id && body.app_visit_id)
 		throw new BadRequestError('Replacement does not admit a visit. Open the app separately.');
 
-	// Starting a session runs code — see authorizeSessionStart for the matrix.
-	// The loaded project is reused below (federation opt-in), not re-fetched.
-	// A soft-deleted project reads as gone here as it does on every read route: its
-	// bytes linger until GC, but no new kernel may serve them.
+	// Consume notebook errors after authorization so role denials retain their 403.
+	const notebookRead = notebooks.getNotebook(pid, nid);
+	notebookRead.catch(() => {});
 	const project = await projects.getProject(pid);
 	if (project.status === 'deleted') {
 		throw new NotFoundError(`Project ${pid} not found`);
 	}
-	// The start gate runs BEFORE the notebook load so a role denial keeps its
-	// canonical 403 even for a bogus or deleted notebook id — only admitted
-	// callers learn whether the notebook exists.
 	let authorization = await authorizeSessionStart(project, user, mode, deps);
 	const appUser = authorization.role === 'app-user';
 	if (
@@ -1291,14 +1288,9 @@ export async function startNotebookSession(input: {
 	) {
 		throw new ForbiddenError('App users cannot customize sessions');
 	}
-	// Verify the notebook exists in this project — throws NotFoundError (→ 404)
-	// otherwise. Prevents provisioning a billable sandbox for a bogus notebook
-	// id. A soft-deleted notebook is treated as missing: getNotebook still
-	// serves it (the delete/GC paths need that), but starting a session on it
-	// would serve deleted content — and, for `app`, recreate the pool
-	// claim that deleteNotebook just cleaned up, permanently (its cleanup never
-	// runs again).
-	const notebook = await notebooks.getNotebook(pid, nid);
+	// Deleted notebooks remain readable until GC. New sessions must not serve
+	// their content or recreate app-pool claims after deletion cleanup.
+	const notebook = await notebookRead;
 	if (
 		notebook.meta.preview &&
 		(input.preview?.id !== notebook.meta.preview.preview_id ||
@@ -1309,9 +1301,7 @@ export async function startNotebookSession(input: {
 	if (notebook.meta.status === 'deleted') {
 		throw new NotFoundError(`Notebook ${nid} not found`);
 	}
-	// A notebook security-label override joins the decision only once one
-	// exists — re-run the gate with it (the label-free pass above already
-	// settled role and project labels).
+	// Notebook labels can further restrict authorization for the project.
 	if (notebook.meta.security_labels !== undefined) {
 		authorization = await authorizeSessionStart(
 			project,
@@ -1321,9 +1311,6 @@ export async function startNotebookSession(input: {
 			notebook.meta.security_labels,
 		);
 	}
-	// The session deadline is the earliest of the entitlement credential expiry
-	// and the subject security context expiry that satisfied any labels — an
-	// active session must not outlive either.
 	const previewRecord = isPreview
 		? await deps.services.previews.get(
 				pid,
@@ -1336,6 +1323,7 @@ export async function startNotebookSession(input: {
 		(previewRecord.state !== 'active' || Date.parse(previewRecord.expires_at) <= Date.now())
 	)
 		throw new NotFoundError('Preview not found');
+	// Sessions must end before their credentials, security context, or preview expires.
 	const authorizationExpiresAt = earliestDeadline(
 		entitlementAuthorizationDeadline(user),
 		earliestDeadline(authorization.subjectContextExpiresAt, previewRecord?.expires_at),
@@ -1358,20 +1346,37 @@ export async function startNotebookSession(input: {
 		throw new BadRequestError('Temporary editor sessions are only available in exclusive mode');
 	}
 	const ephemeral = authorization.ephemeral || editorTemporary || (isPreview && mode === 'edit');
-	const surfaceGrant = (
-		await sessionGrantsFor(
-			project,
-			user,
-			{
-				mode,
-				ephemeral,
-				user_id: user.id,
-				editor_sandbox_sharing: sharing,
-			},
-			deps,
-			notebook.meta.security_labels ?? null,
-		)
-	).surface;
+	const { compute, bucket: bucketHandle, sandbox } = deps;
+	const workspacePolicy = workspaceSourcePolicy(notebook.source);
+	const syncedVersionId = workspacePolicy.persistSessionEdits
+		? undefined
+		: notebook.source.current_version_id;
+	const unsyncedSource = !workspacePolicy.persistSessionEdits && !syncedVersionId;
+	const grants = (session: SessionAdmissionRecord) =>
+		sessionGrantsFor(project, user, session, deps, notebook.meta.security_labels ?? null);
+	const surfaceGrantRead = grants({
+		mode,
+		ephemeral,
+		user_id: user.id,
+		editor_sandbox_sharing: sharing,
+	});
+	// Unsynced notebooks must fail validation before any session scan.
+	const editorReuseRead =
+		mode === 'edit' && !unsyncedSource
+			? sessions.findReusableEditor(pid, nid, user.id, sharing, ephemeral, {
+					claim: existingEditorClaim,
+				})
+			: Promise.resolve(undefined);
+	const readRestoreSnapshot = () =>
+		!ephemeral && workspacePolicy.restoreFilesystemSnapshot
+			? resolveRestoreSnapshot(compute, notebooks, pid, nid, {
+					sharing: mode === 'edit' ? sharing : 'shared',
+					userId: user.id,
+				})
+			: Promise.resolve(undefined);
+	const restoreSnapshotRead = readRestoreSnapshot();
+	for (const read of [surfaceGrantRead, editorReuseRead, restoreSnapshotRead]) read.catch(() => {});
+	const surfaceGrant = (await surfaceGrantRead).surface;
 	const requestedSurfaces = body?.surfaces ?? [];
 	if (requestedSurfaces.length > 0 && mode !== 'edit') {
 		throw new BadRequestError('Session surfaces are only valid for edit sessions');
@@ -1391,8 +1396,6 @@ export async function startNotebookSession(input: {
 			: undefined;
 	const profileOverrideEligible = authorization.profileOverrideEligible;
 	const restrictedViewerCredentials = authorization.restrictedViewerCredentials;
-	const grants = (session: Session) =>
-		sessionGrantsFor(project, user, session, deps, notebook.meta.security_labels ?? null);
 	const tightenAuthorizationDeadline = (session: Session) =>
 		authorizationExpiresAt
 			? sessions.tightenAuthorizationDeadline(pid, session.session_id, authorizationExpiresAt)
@@ -1408,13 +1411,7 @@ export async function startNotebookSession(input: {
 		return current;
 	};
 
-	const workspacePolicy = workspaceSourcePolicy(notebook.source);
-	// Synced sources are read-only mirrors served from the immutable workspace of the
-	// version the source currently points at; a session can't start before a push.
-	const syncedVersionId = workspacePolicy.persistSessionEdits
-		? undefined
-		: notebook.source.current_version_id;
-	if (!workspacePolicy.persistSessionEdits && !syncedVersionId) {
+	if (unsyncedSource) {
 		throw new ConflictError('Synced notebook has not been synced yet');
 	}
 	const notebookPaths = paths.project(pid).notebook(nid);
@@ -1423,11 +1420,7 @@ export async function startNotebookSession(input: {
 	const workspaceArchive = syncedVersionPaths?.workspaceArchive;
 	const pullSourceGit = pullSourceGitOptions(notebook.source, syncedVersionPaths);
 	const workspaceDir = sessionWorkspaceDir(notebook.source, deps.sandbox.workdir);
-	// Staleness provenance: a session that serves a frozen snapshot — a
-	// non-persisting mode (`app`), or any mode on a synced source (a read-only
-	// mirror, even under `edit`) — is stamped with the head committed version it
-	// was provisioned from. The client compares it against the live head for the
-	// "session is stale" banners.
+	// Apps and synced notebooks retain their source version so clients can detect stale sessions.
 	const sourceVersionId =
 		syncedVersionId ??
 		(MODE_POLICY[mode].persistsEdits
@@ -1464,7 +1457,6 @@ export async function startNotebookSession(input: {
 			recovered: true,
 		});
 
-	const { compute, bucket: bucketHandle, sandbox } = deps;
 	const sandboxExposure = sandbox.exposure ?? new SubdomainExposure();
 	const hostname = sandbox.hostname || request.hostname;
 	const { appBaseUrl } = request;
@@ -1490,10 +1482,7 @@ export async function startNotebookSession(input: {
 	);
 	const provisioner = new SandboxProvisioner(compute);
 
-	const editorReuse =
-		mode === 'edit'
-			? await sessions.findReusableEditor(pid, nid, user.id, sharing, ephemeral)
-			: undefined;
+	const editorReuse = await editorReuseRead;
 	if (editorReuse?.takeoverInProgress) throw new TakeoverInProgressError();
 	if (editorReuse?.ownedByOther) {
 		throw new EditSessionOwnedError(
@@ -1550,7 +1539,11 @@ export async function startNotebookSession(input: {
 	};
 	const reusableCandidate = mode === 'edit' ? editorReuse?.session : await reusableApp();
 	if (reusableCandidate) {
-		let reusable = await tightenAuthorizationDeadline(reusableCandidate);
+		const [reusableTightened, reusableGrants] = await Promise.all([
+			tightenAuthorizationDeadline(reusableCandidate),
+			grants(reusableCandidate),
+		]);
+		let reusable = reusableTightened;
 		const authorizationExpired = isPastAuthorizationDeadline(reusable, Date.now());
 		// Role changes must not reuse a kernel with the previous credential policy.
 		const classMismatch =
@@ -1559,7 +1552,6 @@ export async function startNotebookSession(input: {
 				(reusable.restricted_viewer_credentials === true) !== restrictedViewerCredentials);
 		// Reuse does not grant control: a failed probe must not let a viewer
 		// tear down another caller's app.
-		const reusableGrants = await grants(reusable);
 		const mayRetire = reusableGrants.stop;
 		// Only a `running` reconnect can hit a dead kernel; a `starting` reuse has no
 		// kernel yet. Probe what the browser would hit (origin in proxy mode, else url).
@@ -1615,7 +1607,11 @@ export async function startNotebookSession(input: {
 	}
 
 	const client = sessionClientFor(user.credential.kind, request.via ?? 'rest');
-	if (mode === 'edit' && !ephemeral && (await sessions.isClaimRetiring(pid, nid, user.id))) {
+	if (
+		mode === 'edit' &&
+		!ephemeral &&
+		(await sessions.isClaimRetiring(pid, nid, user.id, { claim: existingEditorClaim }))
+	) {
 		deps.metrics?.increment('sessions.editor_claim.lost', 1, { phase: 'preflight' });
 		logEvent({
 			event: 'session_provision',
@@ -1642,11 +1638,9 @@ export async function startNotebookSession(input: {
 	let warmClaim: WarmPoolClaim | undefined;
 	const kernelAuthToken = sandbox.auth === 'on' ? createKernelAuthToken() : undefined;
 
-	// Provision as a saga: if a later step fails, completed steps compensate in
-	// reverse — the session record is terminated (so it does not linger in
-	// `starting` and the reaper collects it) and a provisioned sandbox is
-	// destroyed. Cold provisioning self-cleans on failure; warm claims are
-	// abandoned by the outer catch so pool ownership survives failed cleanup.
+	// Saga compensation retires the session and destroys its sandbox.
+	// Cold provisioning cleans up its own failures. The outer catch abandons warm
+	// claims so the pool retains ownership after failed cleanup.
 	let session: Session | undefined;
 	let sessionRecordAttempted = false;
 	let sandboxMayExist = false;
@@ -1702,13 +1696,10 @@ export async function startNotebookSession(input: {
 			if (!retired.sandbox_reclaimed_at)
 				throw new ConflictError('The selected app is still stopping. Retry shortly.');
 		}
-		const restoreFilesystemSnapshot =
-			!ephemeral && workspacePolicy.restoreFilesystemSnapshot
-				? await resolveRestoreSnapshot(compute, notebooks, pid, nid, {
-						sharing: mode === 'edit' ? sharing : 'shared',
-						userId: user.id,
-					})
-				: undefined;
+		// Retirement can publish a newer snapshot than the speculative read.
+		const restoreFilesystemSnapshot = await (reusableCandidate || replacementTarget
+			? readRestoreSnapshot()
+			: restoreSnapshotRead);
 		const appliedComputeProfile = restoreFilesystemSnapshot
 			? {
 					name: restoreFilesystemSnapshot.compute_profile,
@@ -2117,36 +2108,37 @@ export async function startNotebookSession(input: {
 					providerDeadline === undefined ? undefined : new Date(providerDeadline).toISOString(),
 				);
 			})
-			.step('editor_claim_recheck', async () => {
-				if (mode !== 'edit' || ephemeral) return;
-				if (replacingAfterTakeover && existingEditorClaim?.transfer) {
-					await sessions.completeTakeover(
-						pid,
-						nid,
-						existingEditorClaim.transfer.takeover_id,
-						session!.session_id,
-					);
-					return;
+			// Deletion can miss a starting sandbox. Rechecks after mark_running close that race.
+			// The project needs a separate check because its notebooks remain readable until GC.
+			.step('running_rechecks', async () => {
+				const rechecks = await all({
+					claim: async () => {
+						if (mode !== 'edit' || ephemeral) return;
+						if (replacingAfterTakeover && existingEditorClaim?.transfer) {
+							await sessions.completeTakeover(
+								pid,
+								nid,
+								existingEditorClaim.transfer.takeover_id,
+								session!.session_id,
+							);
+							return;
+						}
+						return sessions.claimEditor(pid, nid, session!.session_id, sharing, user.id);
+					},
+					notebook: () =>
+						(isPreview
+							? notebooks.getNotebook(pid, nid).then((current) => current.meta)
+							: notebooks.getNotebookMeta(pid, nid)
+						).catch(() => null),
+					project: () => projects.getProject(pid).catch(() => null),
+				});
+				if (rechecks.claim && !rechecks.claim.claimed && rechecks.claim.claim.session_id) {
+					throw new EditorClaimLostError(rechecks.claim.claim.session_id);
 				}
-				const result = await sessions.claimEditor(pid, nid, session!.session_id, sharing, user.id);
-				if (!result.claimed && result.claim.session_id) {
-					throw new EditorClaimLostError(result.claim.session_id);
-				}
-			})
-			// A delete during provisioning can miss the starting sandbox. Recheck after
-			// publishing running so either the deletion path or saga compensation retires it.
-			.step('notebook_recheck', async () => {
-				const current = await notebooks.getNotebook(pid, nid).catch(() => null);
-				if (!current || current.meta.status === 'deleted') {
+				if (!rechecks.notebook || rechecks.notebook.status === 'deleted') {
 					throw new NotFoundError(`Notebook ${nid} not found`);
 				}
-			})
-			// The same race one level up, which the check above does NOT cover: a
-			// soft-deleted project keeps its notebooks readable until GC, so
-			// `getNotebook` still answers `active`.
-			.step('project_recheck', async () => {
-				const current = await projects.getProject(pid).catch(() => null);
-				if (!current || current.status === 'deleted') {
+				if (!rechecks.project || rechecks.project.status === 'deleted') {
 					throw new NotFoundError(`Project ${pid} not found`);
 				}
 			})
@@ -2274,11 +2266,10 @@ export async function startNotebookSession(input: {
 		});
 	}
 
-	// An app start can put integration secrets and WIF credentials in front of the
-	// whole admitted audience, so who started it belongs in the project's event log.
-	// Best-effort like every audit append.
+	// App sessions can expose integration secrets and WIF credentials to their audience.
+	// The audit records who started the session.
 	if (MODE_POLICY[mode].sharedApp) {
-		await appendAudit({ ...request, userId: user.id }, 'app.start', () =>
+		const audit = appendAudit({ ...request, userId: user.id }, 'app.start', () =>
 			deps.services.events.append({
 				event: 'app.start',
 				actor: user.id,
@@ -2288,6 +2279,8 @@ export async function startNotebookSession(input: {
 				session_id: session!.session_id,
 			}),
 		);
+		if (deps.backgroundTasks) deps.backgroundTasks.defer(audit);
+		else await audit;
 	}
 
 	return {
