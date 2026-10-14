@@ -46,6 +46,49 @@ Established admission does not list bucket objects. Session listings read each n
 Generic maintenance shares pool snapshots within each pass.
 Operation-count tests cover these budgets, not remote bucket latency.
 
+## Heartbeat scheduling
+
+Project authorization and the initial session read overlap. Project failures take precedence without waiting for session storage.
+The session promise handles rejection immediately, including after a project denial.
+Notebook and preview checks still precede attach authorization. Pool and session renewal retain their CAS checks, including the session reread.
+Response grants use the updated session.
+
+The table covers storage costs for app pools. An unlabeled API heartbeat uses six metadata operations:
+a catalog HEAD, project GET, notebook GET, pool GET, and two session GETs.
+A due heartbeat adds two conditional writes without conflicts. Identity I/O and policy calls are additional.
+Denied projects incur one extra speculative session GET and no renewal writes.
+
+### Measurements
+
+On 2026-10-14, macOS arm64 / Node 24.21.0, with 10 ms injected per metadata operation:
+
+| Workload                       | Serial p50 / p95 (ms) | Overlapped p50 / p95 (ms) |
+| ------------------------------ | --------------------: | ------------------------: |
+| Fresh heartbeat                |           66.9 / 67.6 |               56.0 / 56.4 |
+| Due heartbeat                  |           89.3 / 90.5 |               77.9 / 79.0 |
+| Four concurrent due heartbeats |         121.1 / 123.7 |             109.5 / 114.0 |
+| HTTP proxy authorization       |           33.3 / 34.0 |               33.3 / 33.7 |
+| Existing-visit admission       |         111.6 / 113.2 |             111.1 / 112.1 |
+
+Successful-path operation counts did not change. The in-memory profile showed no meaningful improvement.
+Client and proxy scheduling remain unchanged. No API negotiation or coordinated client upgrade is required.
+
+Run the optional harness from the repository root:
+
+```sh
+mkdir -p "$PWD/.context"
+APP_PERFORMANCE_REPORT="$PWD/.context/app-performance.json" \
+  pnpm --filter @marimo-hub/api test src/appPerformance.test.ts
+```
+
+The harness records p50/p95, bucket operations, authentication, authorization, and policy-provider calls over two warm-ups and 20 samples per workload/profile.
+Each sample starts with an admitted app. Concurrent samples use four service instances sharing one bucket.
+Profiles inject 0 or 10 ms per metadata operation, plus one with 30 ms project reads and 10 ms per policy-provider call.
+Identity I/O has no injected delay. Existing identity caches and first-request writes remain enabled.
+
+Compute is simulated. Proxy samples measure authorization. Reconnect samples repeat admission for the same visit.
+Real browser/kernel refresh and reconnect remain unvalidated. Ordinary CI has no latency thresholds.
+
 ## Code
 
 - [Router](../packages/core/src/services/runtime/AppPoolRouter.ts): routing, presence, and occupancy.
