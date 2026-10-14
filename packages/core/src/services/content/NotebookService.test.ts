@@ -57,6 +57,73 @@ describe('NotebookService', () => {
 		projectId = project.id;
 	});
 
+	describe('cached meta reads', () => {
+		it('revalidates security labels and preserves includeDeleted', async () => {
+			const notebook = await notebooks.createNotebook(
+				projectId,
+				{ title: 'N', description: '', code: '' },
+				ACTOR,
+			);
+			await notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' });
+			const labels = { classification: 'secret', compartments: [] };
+			await notebooks.setSecurityLabels(projectId, notebook.id, labels, ACTOR);
+			const get = vi.spyOn(bucket, 'get');
+			expect(
+				await notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' }),
+			).toEqual(labels);
+			expect(get).toHaveBeenCalledTimes(1);
+			await notebooks.deleteNotebook(projectId, notebook.id, ACTOR);
+			await expect(
+				notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' }),
+			).rejects.toThrow(NotFoundError);
+			expect(
+				await notebooks.getSecurityLabels(projectId, notebook.id, {
+					consistency: 'validated',
+					includeDeleted: true,
+				}),
+			).toEqual(labels);
+		});
+
+		it('revalidates a deletion from another replica on the next read', async () => {
+			const notebook = await notebooks.createNotebook(
+				projectId,
+				{ title: 'N', description: '', code: '' },
+				ACTOR,
+			);
+			await notebooks.getNotebookMeta(projectId, notebook.id, { consistency: 'validated' });
+			await new NotebookService(bucket, catalog).deleteNotebook(projectId, notebook.id, ACTOR);
+			expect(
+				(await notebooks.getNotebookMeta(projectId, notebook.id, { consistency: 'validated' }))
+					.status,
+			).toBe('deleted');
+		});
+
+		it.each(['head', 'get'] as const)(
+			'fails closed when %s fails during revalidation',
+			async (method) => {
+				const notebook = await notebooks.createNotebook(
+					projectId,
+					{ title: 'N', description: '', code: '' },
+					ACTOR,
+				);
+				await notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' });
+				await new NotebookService(bucket, catalog).setSecurityLabels(
+					projectId,
+					notebook.id,
+					{ classification: 'secret', compartments: [] },
+					ACTOR,
+				);
+				vi.spyOn(bucket, method).mockRejectedValueOnce(new Error('storage unavailable'));
+				await expect(
+					notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' }),
+				).rejects.toThrow('storage unavailable');
+				expect(
+					await notebooks.getSecurityLabels(projectId, notebook.id, { consistency: 'validated' }),
+				).toEqual({ classification: 'secret', compartments: [] });
+			},
+		);
+	});
+
 	describe('source updates during sessions', () => {
 		it.each(['update', 'deps', 'restore', 'notebook.py', 'pyproject.toml'] as const)(
 			'blocks %s during editing and permits retry after the editor fails without a sandbox',
