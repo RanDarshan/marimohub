@@ -118,10 +118,7 @@ const TAKEOVER_REQUEST_TTL_MS = Millis.minutes(5);
 const TAKEOVER_DRAIN_LEASE_MS = Millis.minutes(10);
 const TAKEOVER_DRAIN_PROGRESS_TIMEOUT_MS = Millis.minutes(30);
 
-// Coalesce heartbeat persistence: an already-running session is only re-written
-// once its stored heartbeat is older than this. Bounds heartbeat writes to
-// ~1/interval/session regardless of client cadence, while staying well within
-// HEARTBEAT_TTL_MS so a live session is never spuriously expired.
+// The interval limits writes and leaves time before the reaper TTL.
 const HEARTBEAT_PERSIST_INTERVAL_MS = Millis.seconds(60);
 
 /** Sentinel for a session object that vanished between list and read. */
@@ -574,17 +571,13 @@ export class SessionService {
 		}));
 	}
 
-	/** Refresh a running session's heartbeat (keeps it off the TTL reaper).
-	 * Coalesced to ~1 write/60s; never revives a terminal/terminating session.
-	 * Provisioning owns the `starting` to `running` transition so a heartbeat
-	 * cannot create a claim-holding session without a sandbox URL. */
+	/** Heartbeats persist at most once per 60 seconds, but always recheck the session's status. */
 	async heartbeat(projectId: ProjectId, id: SessionId): Promise<Session> {
 		return this.mutate(projectId, id, (session) => {
-			if (session.status !== 'running') return null;
-			if (isPastAuthorizationDeadline(session, Date.now())) return null;
-			const ageMs = Date.now() - new Date(session.last_heartbeat).getTime();
-			if (ageMs < HEARTBEAT_PERSIST_INTERVAL_MS) return null;
-			return { ...session, last_heartbeat: new Date().toISOString() };
+			const now = Date.now();
+			if (session.status !== 'running' || isPastAuthorizationDeadline(session, now)) return null;
+			if (now - Date.parse(session.last_heartbeat) < HEARTBEAT_PERSIST_INTERVAL_MS) return null;
+			return { ...session, last_heartbeat: new Date(now).toISOString() };
 		});
 	}
 
