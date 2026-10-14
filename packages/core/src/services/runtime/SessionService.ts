@@ -6,6 +6,7 @@ import { BUCKET_SCAN_CONCURRENCY, MARIMO_PORT } from '../../constants';
 import type { EditorSandboxSharing, SessionMode } from '../../constants';
 import { mapWithConcurrency } from '../../concurrency';
 import { Millis } from '../../duration';
+import { EtagRecordCache } from '../../etagRecordCache';
 import {
 	ConflictError,
 	EditSessionChangedError,
@@ -155,6 +156,7 @@ export class SessionService {
 	constructor(
 		private bucket: Bucket,
 		private metrics: Metrics = noopMetrics,
+		private readonly recordCache: EtagRecordCache<Session> = new EtagRecordCache(),
 	) {}
 
 	/**
@@ -692,25 +694,13 @@ export class SessionService {
 		return { session: result.value, transitioned: result.written };
 	}
 
-	/**
-	 * List + read every session record under the sessions prefix, handing each to
-	 * `handle` in bounded-parallel (records that vanished between list and read are
-	 * skipped). `etag` is the freshly-read ETag, for a caller doing a conditional
-	 * write within the same pass. Backs every session scan — the request path
-	 * (listActiveByProject on each notebook-table render, findReusable/
-	 * countActiveForUser on create) and the reaper passes.
-	 */
 	private async scanSessions<T>(
 		handle: (session: Session, obj: BucketObject, etag: string) => T | Promise<T>,
 	): Promise<Awaited<T>[]> {
 		return this.scanPrefix(paths.sessionsPrefix, handle);
 	}
 
-	/**
-	 * Scope a scan to a single project's prefix (`_system/sessions/{pid}/`) — the
-	 * partition introduced so the interactive reads (`listActiveByProject`,
-	 * `findReusable`) cost O(that project's sessions), not O(all sessions).
-	 */
+	/** Project scans avoid listing unrelated sessions. */
 	private async scanProject<T>(
 		projectId: ProjectId,
 		handle: (session: Session, obj: BucketObject, etag: string) => T | Promise<T>,
@@ -718,6 +708,10 @@ export class SessionService {
 		return this.scanPrefix(paths.sessionsForProject(projectId), handle);
 	}
 
+	/**
+	 * Each scan lists current ETags and fetches cache misses. Handlers receive
+	 * isolated records so caller mutations cannot poison later scans or CAS writes.
+	 */
 	private async scanPrefix<T>(
 		prefix: string,
 		handle: (session: Session, obj: BucketObject, etag: string) => T | Promise<T>,
@@ -725,10 +719,14 @@ export class SessionService {
 	): Promise<Awaited<T>[]> {
 		const objects = await listAllObjects(this.bucket, prefix);
 		const scanned = await mapWithConcurrency(objects, BUCKET_SCAN_CONCURRENCY, async (obj) => {
+			const cached = this.recordCache.get(obj.key, obj.etag);
+			if (cached) return handle(structuredClone(cached), obj, obj.etag);
 			const body = await this.bucket.get(obj.key);
-			if (!body) return SKIP;
-			// A single corrupt/legacy record must not abort a deployment-wide scan
-			// (listing, reuse, reaper). Skip it (logged) so the good records survive.
+			if (!body) {
+				this.recordCache.delete(obj.key);
+				return SKIP;
+			}
+			// Tolerant scans keep valid records when another record is corrupt.
 			let session: Session;
 			try {
 				session = await readStored(SessionSchema, body, obj.key);
@@ -741,7 +739,8 @@ export class SessionService {
 				);
 				return SKIP;
 			}
-			return handle(session, obj, body.etag);
+			this.recordCache.set(obj.key, body.etag, session);
+			return handle(structuredClone(session), obj, body.etag);
 		});
 		return scanned.filter((r): r is Awaited<T> => r !== SKIP);
 	}

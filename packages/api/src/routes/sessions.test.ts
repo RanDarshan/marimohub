@@ -90,6 +90,13 @@ describe('Session routes', () => {
 	});
 
 	const sessionsPath = (suffix = '') => `/projects/${pid}/notebooks/${nid}/sessions${suffix}`;
+	const cappedAppApi = (compute = makeFakeCompute()) =>
+		createTestApi({
+			bucket,
+			userId: ACTOR,
+			compute,
+			deps: { policy: { maxAppsPerProject: 1, maxConcurrentSessionsPerUser: 1 } },
+		});
 	const editorSessionPath = (suffix = '') =>
 		`/projects/${pid}/notebooks/${nid}/editor-session${suffix}`;
 	const sandboxConfig = (overrides: Partial<ApiDeps['sandbox']> = {}): ApiDeps['sandbox'] => ({
@@ -2407,6 +2414,118 @@ describe('Session routes', () => {
 			status: 'failed',
 			error: { code: 'RESOURCE_EXHAUSTED' },
 		});
+	});
+
+	it.each(['full', 'rejected', 'thrown'] as const)(
+		'loads app cap queues concurrently and reports the project cap before a %s user queue',
+		async (userResult) => {
+			const api = cappedAppApi();
+			const { sessions } = api.deps.services;
+			const incumbent = await sessions.createSession({
+				project_id: pid,
+				notebook_id: createNotebookId(),
+				user_id: ACTOR,
+				mode: 'app',
+			});
+			await sessions.setRunning(pid, incumbent.session_id, 'https://sandbox.example');
+			const listProject = sessions.listActiveAppsForProject.bind(sessions);
+			const listUser = sessions.listActiveForUser.bind(sessions);
+			const userQueueStarted = Promise.withResolvers<void>();
+			const projectQueue = vi
+				.spyOn(sessions, 'listActiveAppsForProject')
+				// Model a competing start that becomes visible after preflight.
+				.mockResolvedValueOnce([])
+				.mockImplementationOnce(async (projectId) => {
+					await userQueueStarted.promise;
+					return listProject(projectId);
+				});
+			const userQueue = vi
+				.spyOn(sessions, 'listActiveForUser')
+				.mockImplementationOnce((...args) => {
+					userQueueStarted.resolve();
+					if (userResult === 'rejected') return Promise.reject(new Error('User scan failed'));
+					if (userResult === 'thrown') throw new Error('User scan failed');
+					return listUser(...args);
+				});
+
+			const error = await expectError(
+				await api.request('POST', sessionsPath(), { mode: 'app' }),
+				429,
+				'RESOURCE_EXHAUSTED',
+			);
+			expect(error.message).toBe(
+				'Concurrent app limit reached for this project (1). Stop an app before starting another.',
+			);
+			expect(projectQueue).toHaveBeenCalledTimes(2);
+			expect(userQueue).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it('preserves project scan errors when the user scan rejects first', async () => {
+		const api = cappedAppApi();
+		const { sessions } = api.deps.services;
+		const userQueueStarted = Promise.withResolvers<void>();
+		vi.spyOn(sessions, 'listActiveAppsForProject')
+			.mockResolvedValueOnce([])
+			.mockImplementationOnce(async () => {
+				await userQueueStarted.promise;
+				throw new ConflictError('Project scan failed');
+			});
+		vi.spyOn(sessions, 'listActiveForUser').mockImplementationOnce(async () => {
+			userQueueStarted.resolve();
+			throw new Error('User scan failed');
+		});
+
+		const error = await expectError(
+			await api.request('POST', sessionsPath(), { mode: 'app' }),
+			409,
+			'CONFLICT',
+		);
+		expect(error.message).toBe('Project scan failed');
+	});
+
+	it.each(['project', 'user'] as const)(
+		'fails closed when the %s cap recheck fails and allows a retry',
+		async (scope) => {
+			const compute = makeFakeCompute();
+			const provision = vi.spyOn(compute, 'create');
+			const api = cappedAppApi(compute);
+			const { sessions } = api.deps.services;
+			const error = new Error('cap storage unavailable');
+			if (scope === 'project') {
+				vi.spyOn(sessions, 'listActiveAppsForProject')
+					.mockResolvedValueOnce([])
+					.mockRejectedValueOnce(error);
+			} else {
+				vi.spyOn(sessions, 'listActiveForUser').mockRejectedValueOnce(error);
+			}
+
+			await expectError(await api.request('POST', sessionsPath(), { mode: 'app' }), 500);
+			expect(provision).not.toHaveBeenCalled();
+			const rejected = await sessions.listSessions(nid);
+			expect(rejected).toHaveLength(1);
+			expect(rejected[0].status).toBe('failed');
+			expect(await sessions.listActiveAppsForProject(pid)).toEqual([]);
+			const retry = await expectOk<ApiSession>(
+				await api.request('POST', sessionsPath(), { mode: 'app' }),
+			);
+			expect(retry.status).toBe('running');
+			expect(retry.session_id).not.toBe(rejected[0].session_id);
+		},
+	);
+
+	it.each([0, -1, undefined])('does not read disabled app cap queues (%s)', async (max) => {
+		const api = createTestApi({
+			bucket,
+			userId: ACTOR,
+			compute: makeFakeCompute(),
+			deps: { policy: { maxAppsPerProject: max, maxConcurrentSessionsPerUser: max } },
+		});
+		const projectQueue = vi.spyOn(api.deps.services.sessions, 'listActiveAppsForProject');
+		const userQueue = vi.spyOn(api.deps.services.sessions, 'listActiveForUser');
+		await expectOk(await api.request('POST', sessionsPath(), { mode: 'app' }));
+		expect(projectQueue).not.toHaveBeenCalled();
+		expect(userQueue).not.toHaveBeenCalled();
 	});
 
 	it('scans deployment-wide sessions once when enforcing the per-user cap', async () => {

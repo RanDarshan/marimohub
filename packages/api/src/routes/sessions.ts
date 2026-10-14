@@ -665,13 +665,7 @@ const CAP_REACHED = {
 		`Concurrent session limit reached (${max}). Terminate a session before starting another.`,
 };
 
-/**
- * The caps that apply to `mode`, each with the queue it bounds. Edit sessions
- * consume the per-user cap. Apps are capped per project AND per starter: without
- * the latter, a user could escape the cost bound entirely by fanning apps out
- * across (freely creatable) projects. Shared apps are few per person, so the
- * starter bound rarely binds on legitimate use.
- */
+/** App caps also apply per user so separate projects cannot bypass the cost limit. */
 function capsFor(deps: ApiDeps, mode: SessionMode, pid: ProjectId, userId: UserId) {
 	const { sessions } = deps.services;
 	const maxSessions = deps.policy.maxConcurrentSessionsPerUser;
@@ -701,11 +695,31 @@ function capsFor(deps: ApiDeps, mode: SessionMode, pid: ProjectId, userId: UserI
 	];
 }
 
+/** Preserve cap precedence even when a later queue fails. */
+async function* loadCapQueues(caps: ReturnType<typeof capsFor>, excludedSessionId?: SessionId) {
+	const results = await Promise.allSettled(
+		caps.flatMap(({ max, message, queue }) => {
+			if (!max || max <= 0) return [];
+			return [
+				Promise.resolve()
+					.then(queue)
+					.then((sessions) => ({
+						max,
+						message: message(max),
+						sessions: sessions.filter((session) => session.session_id !== excludedSessionId),
+					})),
+			];
+		}),
+	);
+	for (const result of results) {
+		if (result.status === 'rejected') throw result.reason;
+		yield result.value;
+	}
+}
+
 /**
- * Cost-DoS guards, checked after reuse so a reconnect/attach never trips them.
- * The project-scoped app cap gets a cheap pre-flight before any record exists.
- * User caps skip it because their queue scans every retained session in the
- * deployment; `assertCapAfterCreate` is the authoritative guard for all caps.
+ * Reuse bypasses cap checks. Only the project cap runs before record creation
+ * because user queues require a deployment-wide scan.
  */
 async function enforceSessionCap(
 	deps: ApiDeps,
@@ -714,23 +728,15 @@ async function enforceSessionCap(
 	userId: UserId,
 	excludedSessionId?: SessionId,
 ): Promise<void> {
-	for (const cap of capsFor(deps, mode, pid, userId)) {
-		if (!cap.preflight || !cap.max || cap.max <= 0) continue;
-		const queued = (await cap.queue()).filter(
-			(session) => session.session_id !== excludedSessionId,
-		);
-		if (queued.length >= cap.max) {
-			throw new ResourceExhaustedError(cap.message(cap.max));
-		}
+	const caps = capsFor(deps, mode, pid, userId).filter((cap) => cap.preflight);
+	for await (const cap of loadCapQueues(caps, excludedSessionId)) {
+		if (cap.sessions.length >= cap.max) throw new ResourceExhaustedError(cap.message);
 	}
 }
 
 /**
- * Close the count-then-create window: N concurrent creates all clear the
- * pre-flight check, because none of their records exists yet. Once the record IS
- * written every racer reads the same set, so ranking by start order admits
- * exactly `max` of them — the rest abort and compensate. Ranking (not counting)
- * is what avoids the other failure mode, where each racer rejects every other.
+ * Concurrent starts can pass preflight together. After creation, queue rank
+ * admits the earliest sessions instead of rejecting every competing start.
  */
 async function assertCapAfterCreate(
 	deps: ApiDeps,
@@ -740,13 +746,11 @@ async function assertCapAfterCreate(
 	sessionId: SessionId,
 	excludedSessionId?: SessionId,
 ): Promise<void> {
-	for (const cap of capsFor(deps, mode, pid, userId)) {
-		if (!cap.max || cap.max <= 0) continue;
-		const rank = (await cap.queue())
-			.filter((session) => session.session_id !== excludedSessionId)
-			.findIndex((s) => s.session_id === sessionId);
-		// rank < 0: our record went terminal underneath us — nothing left to cap.
-		if (rank >= cap.max) throw new ResourceExhaustedError(cap.message(cap.max));
+	const caps = capsFor(deps, mode, pid, userId);
+	for await (const cap of loadCapQueues(caps, excludedSessionId)) {
+		const rank = cap.sessions.findIndex((session) => session.session_id === sessionId);
+		// A missing session is already terminal and no longer consumes capacity.
+		if (rank >= cap.max) throw new ResourceExhaustedError(cap.message);
 	}
 }
 
