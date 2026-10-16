@@ -1,3 +1,4 @@
+import { createPublishStage } from '@marimo-hub/source-control-git/publication';
 import {
 	BadRequestError,
 	ConflictError,
@@ -12,7 +13,6 @@ import type {
 	UpdateChangeRequestInput,
 	SourceControlReader,
 	SourceControlPublisher,
-	SourceControlPublishStage,
 	SourceReadOptions,
 } from '@marimo-hub/core/ports/source-control';
 import { materializeGitDirectory } from '@marimo-hub/source-control-git';
@@ -22,7 +22,12 @@ import { parseAzureRepository } from './repository';
 import type { AzureRepository } from './repository';
 import { AzureTrees, sameTree } from './trees';
 import type { FileTree } from './trees';
-import { validateBranch, normalizeCommit, validatePublication } from './validation';
+import {
+	validateBranch,
+	normalizeCommit,
+	normalizeProviderCommit,
+	validatePublication,
+} from './validation';
 export { parseAzureRepository, validateOrganization } from './repository';
 export type { AzureDevOpsOptions, AzureDevOpsRuntime, AzureCredential } from './client';
 export { ClientSecretCredential } from '@azure/identity';
@@ -44,17 +49,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 			return false;
 		}
 	}
-	private async stage<T>(stage: SourceControlPublishStage, action: () => Promise<T>): Promise<T> {
-		try {
-			return await action();
-		} catch (error) {
-			const status =
-				typeof (error as { providerStatus?: unknown })?.providerStatus === 'number'
-					? (error as { providerStatus: number }).providerStatus
-					: undefined;
-			throw markSourceControlPublishFailure(error, { provider: this.provider, stage, status });
-		}
-	}
+	private readonly stage = createPublishStage(this.provider);
 	private async head(
 		repo: AzureRepository,
 		branch: string,
@@ -66,7 +61,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 		);
 		const ref = refs.find((item) => stringField(item, 'name') === `refs/heads/${branch}`);
 		if (!ref) return null;
-		return normalizeCommit(stringField(ref, 'objectId'));
+		return normalizeProviderCommit(stringField(ref, 'objectId'));
 	}
 	async getBranchHead(repository: string, branch: string, options: SourceReadOptions = {}) {
 		const commit = await this.head(this.repository(repository), branch, options);
@@ -138,7 +133,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 				Array.isArray(commit.parents) &&
 				commit.parents.length === 1 &&
 				typeof commit.parents[0] === 'string' &&
-				normalizeCommit(commit.parents[0]) === parent &&
+				normalizeProviderCommit(commit.parents[0]) === parent &&
 				sameTree(await trees.files(head), desired)
 			);
 		});
@@ -190,7 +185,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 		const commits = record(payload).commits;
 		if (!Array.isArray(commits) || commits.length !== 1)
 			throw new UnavailableError('Invalid Azure DevOps push result');
-		return normalizeCommit(stringField(commits[0], 'commitId'));
+		return normalizeProviderCommit(stringField(commits[0], 'commitId'));
 	}
 	async openChangeRequest(input: OpenChangeRequestInput): Promise<OpenChangeRequestResult> {
 		const { branch, baseCommit } = validatePublication(input);
@@ -263,7 +258,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 				if (
 					(value.status === 'completed' || value.status === 'abandoned') &&
 					source &&
-					normalizeCommit(stringField(source, 'commitId')) === publishedHead
+					normalizeProviderCommit(stringField(source, 'commitId')) === publishedHead
 				)
 					closedMatch ??= existing;
 			}

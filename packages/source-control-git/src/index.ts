@@ -79,7 +79,7 @@ function responseBody(
 	})();
 }
 
-function gitHttp(fetcher: GitFetch, repository: string): HttpClient {
+export function gitHttp(fetcher: GitFetch, repository: string): HttpClient {
 	const limit = new GitFetchByteLimit(repository);
 	return {
 		request: async (request) => {
@@ -110,7 +110,7 @@ function gitHttp(fetcher: GitFetch, repository: string): HttpClient {
 	};
 }
 
-async function assertGitTreeLimits(
+export async function assertGitTreeLimits(
 	directory: string,
 	commit: string,
 	repository: string,
@@ -204,16 +204,20 @@ export async function collectGitDirectoryFiles(
 	return files;
 }
 
-export async function materializeGitDirectory(options: {
+export interface GitFetchOptions {
 	repository: string;
 	remoteUrl: string;
 	commit: string;
 	branch: string;
 	authorization: string;
 	fetcher: GitFetch;
-}): Promise<SourceWorkspaceFile[]> {
+}
+
+export async function withFetchedGit<T>(
+	options: GitFetchOptions,
+	action: (directory: string) => Promise<T>,
+): Promise<T> {
 	const directory = await mkdtemp(join(tmpdir(), 'marimohub-git-'));
-	const gitdir = join(directory, '.git');
 	const remoteUrl = options.remoteUrl;
 	// Fetch indexes the pack after writing it; reject unsafe expansion at that boundary.
 	const guardedFs = {
@@ -231,46 +235,63 @@ export async function materializeGitDirectory(options: {
 		},
 	};
 	try {
-		await git.init({ fs, dir: directory, defaultBranch: options.branch });
-		await git.addRemote({ fs, dir: directory, remote: 'origin', url: remoteUrl });
-		const result = await git.fetch({
-			fs: guardedFs,
-			http: gitHttp(options.fetcher, options.repository),
-			dir: directory,
-			url: remoteUrl,
-			ref: options.branch,
-			remoteRef: options.commit,
-			singleBranch: true,
-			depth: 1,
-			tags: false,
-			headers: {
-				authorization: options.authorization,
-			},
-		});
-		if (result.fetchHead !== options.commit) {
-			throw new UnavailableError('Git server returned a different commit than requested');
+		try {
+			await git.init({ fs, dir: directory, defaultBranch: options.branch });
+			await git.addRemote({ fs, dir: directory, remote: 'origin', url: remoteUrl });
+			const result = await git.fetch({
+				fs: guardedFs,
+				http: gitHttp(options.fetcher, options.repository),
+				dir: directory,
+				url: remoteUrl,
+				ref: options.branch,
+				remoteRef: options.commit,
+				singleBranch: true,
+				depth: 1,
+				tags: false,
+				headers: {
+					authorization: options.authorization,
+				},
+			});
+			if (result.fetchHead !== options.commit) {
+				throw new UnavailableError('Git server returned a different commit than requested');
+			}
+			await git.writeRef({
+				fs,
+				dir: directory,
+				ref: `refs/heads/${options.branch}`,
+				value: options.commit,
+				force: true,
+			});
+			await git.writeRef({
+				fs,
+				dir: directory,
+				ref: `refs/remotes/origin/${options.branch}`,
+				value: options.commit,
+				force: true,
+			});
+			await assertGitTreeLimits(directory, options.commit, options.repository);
+		} catch (error) {
+			if (error instanceof BadRequestError || error instanceof UnavailableError) throw error;
+			throw Object.assign(new UnavailableError('Git data could not be fetched', { cause: error }), {
+				providerStatus: (error as { providerStatus?: unknown } | null)?.providerStatus,
+			});
 		}
-		await git.writeRef({
-			fs,
-			dir: directory,
-			ref: `refs/heads/${options.branch}`,
-			value: options.commit,
-			force: true,
-		});
-		await git.writeRef({
-			fs,
-			dir: directory,
-			ref: `refs/remotes/origin/${options.branch}`,
-			value: options.commit,
-			force: true,
-		});
-		await assertGitTreeLimits(directory, options.commit, options.repository);
-		await git.checkout({ fs, dir: directory, ref: options.branch, force: true });
-		return await collectGitDirectoryFiles(gitdir, options.repository);
-	} catch (error) {
-		if (error instanceof BadRequestError || error instanceof UnavailableError) throw error;
-		throw new UnavailableError('Git data could not be fetched', { cause: error });
+		return await action(directory);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+}
+
+export async function materializeGitDirectory(
+	options: GitFetchOptions,
+): Promise<SourceWorkspaceFile[]> {
+	return withFetchedGit(options, async (directory) => {
+		try {
+			await git.checkout({ fs, dir: directory, ref: options.branch, force: true });
+			return await collectGitDirectoryFiles(join(directory, '.git'), options.repository);
+		} catch (error) {
+			if (error instanceof BadRequestError || error instanceof UnavailableError) throw error;
+			throw new UnavailableError('Git data could not be materialized', { cause: error });
+		}
+	});
 }
