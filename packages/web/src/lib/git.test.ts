@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest';
 import type { NotebookDetail } from '@/types';
 import {
 	ENTRY_NOTEBOOK_PATTERN,
+	pullRepositoryInput,
+	changeRequestTerms,
 	gitBranchUrl,
 	gitCommitUrl,
 	gitCoords,
 	gitEntryPath,
 	gitSourceUrl,
+	isAzureDevOpsRepoInput,
 	isGitHubRepoInput,
 	isRepoInput,
 	isValidRootPath,
@@ -293,4 +296,105 @@ describe('isValidRootPath', () => {
 	])('rejects %j', (input) => {
 		expect(isValidRootPath(input)).toBe(false);
 	});
+});
+
+describe('Azure DevOps links', () => {
+	const coords = {
+		provider: 'azure-devops' as const,
+		baseUrl: 'https://dev.azure.com/acme/Project%20One/_git/notebooks',
+		branch: 'feature/a#b',
+		root_path: 'apps',
+		entry_notebook: 'main file.py',
+		commit: 'abc123',
+	};
+	it('builds branch and pinned file URLs using Azure version selectors', () => {
+		expect(gitBranchUrl(coords, coords.branch)).toBe(`${coords.baseUrl}?version=GBfeature%2Fa%23b`);
+		expect(gitSourceUrl(coords)).toBe(
+			`${coords.baseUrl}?path=%2Fapps%2Fmain%20file.py&version=GCabc123`,
+		);
+		expect(gitSourceUrl({ ...coords, commit: null })).toBe(
+			`${coords.baseUrl}?path=%2Fapps%2Fmain%20file.py&version=GBfeature%2Fa%23b`,
+		);
+		expect(gitCommitUrl(coords, 'abc123')).toBe(`${coords.baseUrl}/commit/abc123`);
+		expect(providerLabel('azure-devops')).toBe('Azure DevOps');
+	});
+});
+
+describe('configured pull providers', () => {
+	const azure = 'https://dev.azure.com/acme/project/_git/repo';
+	it.each([
+		{ providers: ['github'], github: true, azure: false },
+		{ providers: ['azure-devops'], github: false, azure: true },
+		{ providers: ['github', 'azure-devops'], github: true, azure: true },
+		{ providers: ['gitlab', 'unknown', 'constructor'], github: false, azure: false },
+		{ providers: [], github: false, azure: false },
+	])(
+		'validates only advertised providers: $providers',
+		({ providers, github, azure: supportsAzure }) => {
+			const input = pullRepositoryInput(providers);
+			expect(input.validate('team/repo')).toBe(github);
+			expect(input.validate(azure)).toBe(supportsAzure);
+			expect(input.validate('https://gitlab.com/team/repo')).toBe(false);
+			expect(input.available).toBe(github || supportsAzure);
+		},
+	);
+	it('keeps enterprise URLs available without treating every custom host as GitHub', () => {
+		expect(pullRepositoryInput(['github']).validate('https://git.acme.corp/team/repo')).toBe(true);
+		expect(pullRepositoryInput(['azure-devops']).validate('https://git.acme.corp/team/repo')).toBe(
+			false,
+		);
+	});
+	it('uses configured providers for labels, examples, and validation messages', () => {
+		const azureInput = pullRepositoryInput(['azure-devops']);
+		expect(azureInput.label).toBe('Connect to Azure DevOps');
+		expect(azureInput.placeholder).toContain('dev.azure.com');
+		expect(azureInput.hint).not.toContain('GitHub');
+		const mixed = pullRepositoryInput(['github', 'azure-devops']);
+		expect(mixed.label).toBe('Connect to a repository');
+		expect(mixed.hint).toContain('GitHub');
+		expect(mixed.hint).toContain('Azure DevOps');
+	});
+	it('keeps unknown providers on generic change-request terms', () => {
+		expect(changeRequestTerms('constructor')).toMatchObject({
+			kind: 'change request',
+			open: 'Open change request',
+		});
+	});
+});
+
+describe('Azure repository identity', () => {
+	it.each([
+		'https://code.example.com/collection/project/_git/repo',
+		'https://acme.visualstudio.com/project/_git/repo',
+		'https://dev.azure.com:8443/acme/project/_git/repo',
+		'http://dev.azure.com/acme/project/_git/repo',
+	])('does not trust an Azure claim for an unsupported origin: %s', (repo) => {
+		expect(gitCoords(gitSource({ provider: 'azure-devops', repo }))).toBeNull();
+	});
+
+	it('preserves .git in Azure repository links', () => {
+		const repo = 'https://dev.azure.com/acme/project/_git/notebooks.git';
+		const coords = gitCoords(gitSource({ provider: 'azure-devops', repo }));
+		expect(coords).toMatchObject({ provider: 'azure-devops', baseUrl: repo });
+		expect(pullRepositoryInput(['azure-devops']).validate(repo)).toBe(true);
+		expect(gitSourceUrl(coords!)).toBe(`${repo}?path=%2Fapp.py&version=GCabc123def4567890`);
+	});
+
+	it.each(['-acme', 'acme_org', 'acme%20org', 'acme%2Eorg', 'a'.repeat(51), '%C3%A9quipe'])(
+		'rejects organization names outside the server grammar: %s',
+		(organization) => {
+			const repo = `https://dev.azure.com/${organization}/project/_git/repo`;
+			expect(isAzureDevOpsRepoInput(repo)).toBe(false);
+			expect(pullRepositoryInput(['azure-devops']).validate(repo)).toBe(false);
+		},
+	);
+
+	it.each(['acme', 'Acme-123', '%61cme', 'a'.repeat(50)])(
+		'accepts decoded organization names within the server grammar: %s',
+		(organization) => {
+			expect(
+				isAzureDevOpsRepoInput(`https://dev.azure.com/${organization}/project/_git/repo`),
+			).toBe(true);
+		},
+	);
 });

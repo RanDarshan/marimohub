@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import isomorphicGit from 'isomorphic-git';
 import { BadRequestError } from '@marimo-hub/core/errors';
 import {
 	MAX_GIT_DIRECTORY_BYTES,
@@ -12,13 +13,8 @@ import {
 	MAX_GIT_FETCH_BYTES,
 } from '@marimo-hub/core/ports/source-control';
 import { MAX_WORKSPACE_FILE_BYTES } from '@marimo-hub/core/constants';
-import type { GitHubFetch } from './githubClient';
-import {
-	assertGitCheckoutLimits,
-	collectGitDirectoryFiles,
-	GitFetchByteLimit,
-	materializeGitDirectory,
-} from './githubGitDirectory';
+import type { GitFetch } from './index';
+import { collectGitDirectoryFiles, GitFetchByteLimit, materializeGitDirectory } from './index';
 
 const temporaryDirectories: string[] = [];
 
@@ -59,7 +55,7 @@ function concat(...parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
 	return result;
 }
 
-function uploadPackFetcher(repository: string): GitHubFetch {
+function uploadPackFetcher(repository: string): GitFetch {
 	return async (url, init) => {
 		if (url.includes('/info/refs')) {
 			const advertised = execFileSync('git', [
@@ -97,7 +93,11 @@ afterEach(async () => {
 	);
 });
 
-const ORIGINS = ['https://github.com', 'https://git.acme.corp'];
+const ORIGINS = [
+	'https://github.com',
+	'https://git.acme.corp',
+	'https://dev.azure.com/org/project/_git',
+];
 
 // Git subprocess tests; need headroom when the whole suite shares the CPU.
 describe('materializeGitDirectory', { timeout: 15_000 }, () => {
@@ -131,12 +131,10 @@ describe('materializeGitDirectory', { timeout: 15_000 }, () => {
 
 		const files = await materializeGitDirectory({
 			repository: `${origin}/owner/repo`,
-			origin,
-			owner: 'owner',
-			repo: 'repo',
+			remoteUrl: `${origin}/owner/repo.git`,
 			commit,
 			branch: 'main',
-			token: 'installation-secret',
+			authorization: 'Bearer installation-secret',
 			fetcher: async (url, init) => {
 				expect(url.startsWith(`${origin}/owner/repo.git/`)).toBe(true);
 				return uploadPackFetcher(source)(url, init);
@@ -171,11 +169,10 @@ describe('materializeGitDirectory', { timeout: 15_000 }, () => {
 
 		const files = await materializeGitDirectory({
 			repository: 'owner/repo',
-			owner: 'owner',
-			repo: 'repo',
+			remoteUrl: 'https://github.com/owner/repo.git',
 			commit,
 			branch,
-			token: 'installation-secret',
+			authorization: 'Bearer installation-secret',
 			fetcher: uploadPackFetcher(source),
 		});
 		const restored = await temporaryDirectory('marimohub-git-quoted-branch-restored-');
@@ -189,60 +186,142 @@ describe('materializeGitDirectory', { timeout: 15_000 }, () => {
 		expect(git(restored, ['branch', '--show-current'])).toBe(branch);
 		expect(git(restored, ['status', '--porcelain'])).toBe('');
 	});
+	it('materializes a native Git pack containing delta-compressed files', async () => {
+		const source = await temporaryDirectory('marimohub-git-delta-source-');
+		git(source, ['init', '-b', 'main']);
+		const contents = Array.from({ length: 5000 }, (_, index) => `line ${index}\n`).join('');
+		await writeFile(join(source, 'first.txt'), contents);
+		await writeFile(join(source, 'second.txt'), contents.replace('line 100', 'changed 100'));
+		git(source, ['add', '.']);
+		git(source, ['commit', '-m', 'Similar files']);
+		git(source, ['repack', '-adf']);
+		const packdir = join(source, '.git', 'objects', 'pack');
+		const idx = (await readdir(packdir)).find((path) => path.endsWith('.idx'))!;
+		expect(git(source, ['verify-pack', '-v', join(packdir, idx)])).toMatch(
+			/ blob\s+\d+ \d+ \d+ \d+ [a-f0-9]{40}/,
+		);
+		const files = await materializeGitDirectory({
+			repository: 'owner/deltas',
+			remoteUrl: 'https://github.com/owner/deltas.git',
+			commit: git(source, ['rev-parse', 'HEAD']),
+			branch: 'main',
+			authorization: 'Bearer token',
+			fetcher: uploadPackFetcher(source),
+		});
+		expect(files.map((file) => file.path)).toContain('index');
+	});
 
-	it('rejects a smart-HTTP response beyond the Git pack limit', async () => {
-		const fetcher: GitHubFetch = async () =>
-			new Response('too large', {
-				headers: { 'content-length': String(MAX_GIT_FETCH_BYTES + 1) },
+	it.each([false, true])(
+		'cancels an oversized HTTP response even if cancellation fails: %s',
+		async (failCancellation) => {
+			const cancel = vi.fn(async () => {
+				if (failCancellation) throw new Error('Cancellation failed');
 			});
-		await expect(
-			materializeGitDirectory({
-				repository: 'owner/large-repo',
-				owner: 'owner',
-				repo: 'large-repo',
-				commit: 'a'.repeat(40),
-				branch: 'main',
-				token: 'token',
-				fetcher,
-			}),
-		).rejects.toBeInstanceOf(BadRequestError);
-	});
+			const fetcher: GitFetch = async () =>
+				new Response(new ReadableStream({ cancel }), {
+					headers: { 'content-length': String(MAX_GIT_FETCH_BYTES + 1) },
+				});
+			await expect(
+				materializeGitDirectory({
+					repository: 'owner/large-repo',
+					remoteUrl: 'https://github.com/owner/large-repo.git',
+					commit: 'a'.repeat(40),
+					branch: 'main',
+					authorization: 'Bearer token',
+					fetcher,
+				}),
+			).rejects.toBeInstanceOf(BadRequestError);
+			expect(cancel).toHaveBeenCalledOnce();
+		},
+	);
 
-	it('rejects a file beyond the expanded-object per-file cap', async () => {
-		const checkout = await temporaryDirectory('marimohub-git-expanded-file-');
-		const file = join(checkout, 'large.bin');
-		await writeFile(file, '');
-		await truncate(file, MAX_WORKSPACE_FILE_BYTES + 1);
-
-		await expect(assertGitCheckoutLimits(checkout, 'owner/expanded')).rejects.toThrow(
-			`${MAX_WORKSPACE_FILE_BYTES}-byte limit`,
-		);
-	});
-
-	it('rejects too many files after Git pack expansion', async () => {
-		const checkout = await temporaryDirectory('marimohub-git-expanded-files-');
-		for (let index = 0; index < MAX_GIT_EXPANDED_FILES + 1; index++) {
-			await writeFile(join(checkout, `file-${index}`), '');
+	it.each([
+		{
+			kind: 'large file',
+			count: 1,
+			size: MAX_WORKSPACE_FILE_BYTES + 1,
+			limit: `${MAX_WORKSPACE_FILE_BYTES}-byte`,
+		},
+		{
+			kind: 'many files',
+			count: MAX_GIT_EXPANDED_FILES + 1,
+			size: 0,
+			limit: `${MAX_GIT_EXPANDED_FILES}-file`,
+		},
+		{
+			kind: 'cumulative bytes',
+			count: 5,
+			size: Math.floor(MAX_GIT_EXPANDED_BYTES / 5) + 1,
+			limit: `${MAX_GIT_EXPANDED_BYTES}-byte`,
+		},
+	])('rejects compressed $kind before writing a checkout', async ({ count, size, limit }) => {
+		const source = await temporaryDirectory('marimohub-git-expansion-source-');
+		git(source, ['init', '-b', 'main']);
+		for (let index = 0; index < count; index++) {
+			const file = join(source, `file-${index}`);
+			await writeFile(file, '');
+			await truncate(file, size);
 		}
-
-		await expect(assertGitCheckoutLimits(checkout, 'owner/expanded')).rejects.toThrow(
-			`${MAX_GIT_EXPANDED_FILES}-file limit`,
-		);
-	});
-
-	it('rejects cumulative bytes after Git pack expansion', async () => {
-		const checkout = await temporaryDirectory('marimohub-git-expanded-bytes-');
-		const fileSize = Math.floor(MAX_GIT_EXPANDED_BYTES / 5) + 1;
-		for (let index = 0; index < 5; index++) {
-			const path = join(checkout, `file-${index}`);
-			await writeFile(path, '');
-			await truncate(path, fileSize);
+		git(source, ['add', '.']);
+		git(source, ['commit', '-m', 'Oversized tree']);
+		const checkout = vi.spyOn(isomorphicGit, 'checkout');
+		const readCommit = vi.spyOn(isomorphicGit, 'readCommit');
+		try {
+			await expect(
+				materializeGitDirectory({
+					repository: 'owner/expanded',
+					remoteUrl: 'https://github.com/owner/expanded.git',
+					commit: git(source, ['rev-parse', 'HEAD']),
+					branch: 'main',
+					authorization: 'Bearer token',
+					fetcher: uploadPackFetcher(source),
+				}),
+			).rejects.toThrow(limit);
+			expect(checkout).not.toHaveBeenCalled();
+			if (size > MAX_WORKSPACE_FILE_BYTES) expect(readCommit).not.toHaveBeenCalled();
+		} finally {
+			checkout.mockRestore();
+			readCommit.mockRestore();
 		}
-
-		await expect(assertGitCheckoutLimits(checkout, 'owner/expanded')).rejects.toThrow(
-			`${MAX_GIT_EXPANDED_BYTES}-byte limit`,
-		);
 	});
+
+	it.each(['tree', 'commit'] as const)(
+		'rejects repeated %s entries before creating checkout directories',
+		async (type) => {
+			const source = await temporaryDirectory('marimohub-git-directory-expansion-');
+			git(source, ['init', '-b', 'main']);
+			const empty = git(source, ['mktree'], '');
+			const object =
+				type === 'tree' ? empty : git(source, ['commit-tree', empty, '-m', 'Submodule']);
+			const mode = type === 'tree' ? '040000' : '160000';
+			const tree = git(
+				source,
+				['mktree'],
+				Array.from(
+					{ length: MAX_GIT_EXPANDED_FILES + 1 },
+					(_, index) => `${mode} ${type} ${object}\tdirectory-${index}\n`,
+				).join(''),
+			);
+			const commit = git(source, ['commit-tree', tree, '-m', 'Many empty directories']);
+			git(source, ['update-ref', 'refs/heads/main', commit]);
+			const checkout = vi.spyOn(isomorphicGit, 'checkout');
+			try {
+				await expect(
+					materializeGitDirectory({
+						repository: 'owner/expanded',
+						remoteUrl: 'https://github.com/owner/expanded.git',
+						commit,
+						branch: 'main',
+						authorization: 'Bearer token',
+						fetcher: uploadPackFetcher(source),
+					}),
+				).rejects.toThrow(`${MAX_GIT_EXPANDED_FILES}-directory limit`);
+				expect(checkout).not.toHaveBeenCalled();
+			} finally {
+				checkout.mockRestore();
+			}
+		},
+	);
 
 	it('rejects a materialized Git directory beyond the file-count cap', async () => {
 		const gitdir = await temporaryDirectory('marimohub-git-many-files-');
@@ -280,11 +359,10 @@ describe('materializeGitDirectory', { timeout: 15_000 }, () => {
 
 		const files = await materializeGitDirectory({
 			repository: 'owner/repo',
-			owner: 'owner',
-			repo: 'repo',
+			remoteUrl: 'https://github.com/owner/repo.git',
 			commit,
 			branch: 'main',
-			token: 'installation-secret',
+			authorization: 'Bearer installation-secret',
 			fetcher: uploadPackFetcher(source),
 		});
 		const restored = await temporaryDirectory('marimohub-git-symlink-restored-');
