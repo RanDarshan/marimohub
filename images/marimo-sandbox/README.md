@@ -2,7 +2,9 @@
 
 The manifest tags `latest`, `py3.13-marimo<version>`, and `sha-<commit>` support
 `linux/amd64` and `linux/arm64`, as do their `-vscode`, `-opencode`, and `-tools` variants.
-Source tags ending in `-amd64` or `-arm64` contain only that architecture.
+The workflow builds each architecture as a single-architecture source tag,
+`sha-<commit>[-variant]-<arch>` (for example `sha-<commit>-vscode-arm64`), and creates the
+manifest tags from them. GHCR has no retention policy for source tags, so they accumulate with every publish.
 
 Build from the repository root with the required `notebook_bridge` context:
 

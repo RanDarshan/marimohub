@@ -92,16 +92,29 @@ classes behave differently on purpose:
 
 ## Shutdown budgets
 
-On SIGTERM or SIGINT, the Node server stops loop ticks and closes its HTTP listener.
-It waits for requests, background tasks, and maintenance work before it disposes compute clients and flushes telemetry.
-This includes capture and destroy operations that outlive their deadlines.
+On SIGTERM or SIGINT, the Node server:
+
+1. Stops loop ticks and closes its HTTP listener.
+2. Gives in-flight requests 10 seconds or half the drain budget, whichever is shorter. It then closes idle and upgraded connections, including proxied kernel WebSockets, so open notebook tabs do not hold the drain.
+3. Waits for background tasks, maintenance work, and runtime work, including captures and destroys that outlive their deadlines. A running maintenance cycle finishes its current step, skips the rest, and releases its lease, so a replacement replica can take over at once.
+4. Disposes compute clients and flushes telemetry.
 
 `MARIMOHUB_SHUTDOWN_TIMEOUT_SECONDS` sets the drain budget: 120 seconds for maintenance or 10 seconds for API replicas by default.
-On expiry, the server logs `drain_timeout` and allows up to 10 seconds for final cleanup.
-A forced exit can interrupt unfinished captures.
+On expiry, the server logs `drain_timeout` and allows up to 10 seconds for final cleanup. A forced exit can interrupt unfinished captures.
+A second signal during the drain exits immediately, without cleanup.
 
-Set the container termination grace to at least the drain budget plus 20 seconds.
-The Helm chart derives this from `maintenance.shutdownTimeoutSeconds`. The Kubernetes example uses 140 seconds for maintenance.
+Set the platform's kill window to at least the budget plus 20 seconds (140 seconds for maintenance with the default budget):
+
+| Platform          | Setting (default)                            | Guidance                                                                                   |
+| ----------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Kubernetes / Helm | `terminationGracePeriodSeconds` (30 s)       | The chart derives it from `maintenance.shutdownTimeoutSeconds`. API pods fit the default.  |
+| Docker / Compose  | `stop_grace_period`, `docker stop -t` (10 s) | `140s` when `MARIMOHUB_RUN_MAINTENANCE=true`. The compose examples set it.                 |
+| Cloud Run         | Fixed (10 s)                                 | Set the budget to 10 or less and expect a forced drain, or run maintenance on GKE or a VM. |
+| Amazon ECS        | `stopTimeout` (30 s, maximum 120 s)          | `stopTimeout: 120` with a budget of 100 or less.                                           |
+| systemd           | `TimeoutStopSec` (90 s)                      | `TimeoutStopSec=140` for a maintenance unit, or lower the budget.                          |
+
+With Helm, set the budget only through `maintenance.shutdownTimeoutSeconds`.
+The chart rejects `MARIMOHUB_SHUTDOWN_TIMEOUT_SECONDS` in `extraEnv`, `config`, and `secrets`, because API pods would get a budget longer than their termination grace.
 
 ## Background loops
 
@@ -205,11 +218,71 @@ notebooks, version history, and the catalog all live there.
   mutable records. Restore all of them from the same point-in-time bucket
   snapshot. Their write rules are described in
   [How it works](./architecture.md).
+- **Recover the catalog** with [catalog recovery](#catalog-recovery) when a
+  restore or an outage leaves `_system/catalog.json` or its current snapshot
+  missing.
 
 ::: tip Notebook history is already in the store
 Per-notebook version history is kept in object storage, so bucket backups
 capture it automatically — no separate export.
 :::
+
+## Catalog recovery
+
+The hub blocks, with `NOT_INITIALIZED` and `Catalog recovery required`, when the current snapshot is missing or `_system/catalog.json` is missing while data exists.
+Empty `system.initialize` snapshots from a crashed or concurrent first boot do not count as data.
+The hub never recovers automatically; only fresh storage initializes on boot.
+
+The offline `catalog-recovery` command in the container image writes a new catalog snapshot.
+`--rebuild` discovers projects, notebooks, and jobs from records. `--snapshot SNAPSHOT_ID` restores a surviving snapshot's membership with current metadata.
+It supports the `s3`, `gcs`, `azure`, and `fs` backends. Run it with `--help` for the flags.
+
+1. [Back up](#backups-restore) the bucket.
+2. Stop all writers until step 6: API replicas, maintenance processes, scheduled triggers, and notebook sandboxes.
+3. Run a dry-run (the default) with the deployment's `MARIMOHUB_STORAGE_*` variables and `--rebuild` or `--snapshot SNAPSHOT_ID`. Prefer a `current` or `previous` snapshot candidate; an `unverified` snapshot can be an uncommitted write.
+4. Review the JSON report. Errors block apply. Warnings require `--accept-warnings`; rebuild always warns, because discovery cannot prove that a record was published. `excluded` issues list records left out of the catalog: preview runtime notebooks, import attempts not confirmed complete, jobs with a deletion fence, and, in `--snapshot` mode, projects, notebooks, and jobs absent from the selected snapshot.
+5. Run the same command with `--apply REPORT_TOKEN --writers-stopped --actor USER_ID`. `USER_ID` is the operator's marimohub user ID, recorded in the snapshot and a `system.recover` audit event.
+6. Check the recovered projects and notebooks, then restart the writers.
+
+The token covers the report and everything under `projects/`, `_system/snapshots/`, `_system/job-deletions/`, and `_system/catalog.json`, so any change after the dry-run makes it stale.
+If another writer moves the catalog pointer during apply, the command deletes its snapshot and exits with a conflict; run the dry-run again.
+
+| Exit code | Meaning                                                                                                                    |
+| --------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 0         | Dry-run report has no blocking errors (warnings and exclusions are allowed), or apply succeeded.                           |
+| 1         | Invalid arguments, unsupported storage, stale token, unaccepted warnings, blocked apply, write conflict, or storage error. |
+| 2         | Dry-run report has blocking errors. The report is on stdout; the reasons are on stderr.                                    |
+
+Limits:
+
+- Snapshot mode keeps current metadata, including deletion status, permissions, security labels, and job schedules. Deleted projects and notebooks keep their status.
+- Rebuild mode can include ambiguous records left by failed creates or expired import receipts. Review every entry.
+- Missing or invalid metadata, referenced notebook content, or job history indexes block apply. Recovery does not repair these objects or restore history.
+
+Docker (with `fs` storage, also mount the storage directory at the hub's path, for example `-v /var/lib/marimohub:/var/lib/marimohub`):
+
+```bash
+docker compose stop hub   # stop every writer first
+docker run --rm --env-file marimohub.env ghcr.io/marimo-team/marimohub:X.Y.Z \
+  node dist/catalog-recovery.mjs --rebuild
+docker run --rm --env-file marimohub.env ghcr.io/marimo-team/marimohub:X.Y.Z \
+  node dist/catalog-recovery.mjs --rebuild --accept-warnings \
+  --apply REPORT_TOKEN --writers-stopped --actor USER_ID
+```
+
+Kubernetes, for a Helm release named `marimohub` (add any `extraEnv` values the Deployments set; for apply, append the apply flags to `command`):
+
+```bash
+kubectl scale deployment marimohub marimohub-maintenance --replicas=0
+kubectl run marimohub-catalog-recovery --rm -i --restart=Never \
+  --image=ghcr.io/marimo-team/marimohub:X.Y.Z \
+  --overrides='{"spec":{"serviceAccountName":"marimohub","containers":[{
+    "name":"marimohub-catalog-recovery","image":"ghcr.io/marimo-team/marimohub:X.Y.Z",
+    "command":["node","dist/catalog-recovery.mjs","--rebuild"],
+    "envFrom":[{"configMapRef":{"name":"marimohub-config"}},{"secretRef":{"name":"marimohub-secrets"}}]}]}}'
+```
+
+The `marimohub-linux-*` binaries do not include the command. From a repository checkout, `pnpm --filter @marimo-hub/server catalog:recover` takes the same arguments.
 
 ## Upgrades
 
@@ -430,15 +503,3 @@ Compute backends differ in cost model — pick per [Compute](/compute):
   orphan backstops.
 - `kubernetes` / `docker`: you own the nodes; cap per-kernel CPU/memory/GPU.
 - `MARIMOHUB_MAX_SESSIONS_PER_USER` bounds concurrent kernels per user.
-
-## Catalog recovery
-
-A missing current snapshot, or a missing catalog with existing data, requires recovery.
-Stop all writers, then inspect the storage with a dry-run:
-
-```bash
-pnpm --filter @marimo-hub/server catalog:recover --rebuild
-```
-
-Follow the [recovery runbook](https://github.com/marimo-team/marimohub/blob/main/development_docs/operations.md#inspect-and-recover-the-catalog)
-to select a snapshot or rebuild from records, review the report, and apply recovery.

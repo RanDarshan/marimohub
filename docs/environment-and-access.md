@@ -71,6 +71,7 @@ The hub sets these variables in a sandbox. Notebook code can read them; projects
 
 Endpoint delivery removes static AWS credential keys from integration variables and defaults, so SDKs use the container provider.
 Jobs always use `env` delivery.
+See [Refreshable credentials](./workload-identity-federation.md#refreshable-credentials) for the token lifetime, revocation checks, S3 integration endpoints, and reserved variable names.
 
 ## Testing and failures
 

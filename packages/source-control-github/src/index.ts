@@ -233,6 +233,7 @@ export class GitHubAppPublisher implements SourceControlPublisher, SourceControl
 		repository: string,
 		commit: string,
 		branch: string,
+		options: SourceReadOptions = {},
 	): Promise<SourceWorkspaceFile[]> {
 		validateCommit(commit);
 		validateBranch(branch);
@@ -244,8 +245,9 @@ export class GitHubAppPublisher implements SourceControlPublisher, SourceControl
 			repo,
 			commit,
 			branch,
-			token: await this.client.installationToken(owner, repo, 'read'),
+			token: await this.client.installationToken(owner, repo, 'read', options.signal),
 			fetcher: this.fetcher,
+			signal: options.signal,
 		});
 	}
 

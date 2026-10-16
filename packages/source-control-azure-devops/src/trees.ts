@@ -1,6 +1,6 @@
 import { readTreeWorkspace } from '@marimo-hub/source-control-git/workspace';
 import { BadRequestError, ConflictError, UnavailableError } from '@marimo-hub/core/errors';
-import { isSafeWorkspaceRootPath, WORKSPACE_LIMITS } from '@marimo-hub/core/remote-workspace';
+import { WORKSPACE_LIMITS } from '@marimo-hub/core/remote-workspace';
 import type {
 	SourceControlChange,
 	SourceWorkspaceFile,
@@ -9,11 +9,11 @@ import type {
 import { boundedBytes, record, stringField } from './client';
 import type { AzureClient } from './client';
 import type { AzureRepository } from './repository';
-import { normalizeCommit, normalizeProviderCommit } from './validation';
-
-export { blobId, sameTree } from '@marimo-hub/source-control-git/file-tree';
-export type { FileTree } from '@marimo-hub/source-control-git/file-tree';
-import { blobId, applyChanges } from '@marimo-hub/source-control-git/file-tree';
+import {
+	normalizeCommit,
+	normalizeProviderCommit,
+} from '@marimo-hub/source-control-git/validation';
+import { assertBlobContents, FileTreeBuilder } from '@marimo-hub/source-control-git/file-tree';
 import type { FileTree, TreeEntry } from '@marimo-hub/source-control-git/file-tree';
 
 export class AzureTrees {
@@ -38,38 +38,33 @@ export class AzureTrees {
 		);
 		if (response.truncated === true || !Array.isArray(response.treeEntries))
 			throw new BadRequestError('Azure DevOps tree is incomplete');
-		const tree: FileTree = new Map();
-		const paths = new Set<string>();
+		const tree = new FileTreeBuilder('Azure DevOps');
 		for (const item of response.treeEntries) {
 			const entry = record(item);
-			const path = stringField(entry, 'relativePath');
-			if (!isSafeWorkspaceRootPath(path))
-				throw new BadRequestError('Unsafe Azure DevOps tree path');
-			const type = stringField(entry, 'gitObjectType');
-			const mode = String(entry.mode);
-			const validMode =
-				(type === 'tree' && ['040000', '40000'].includes(mode)) ||
-				(type === 'blob' && ['100644', '100755', '120000'].includes(mode)) ||
-				(type === 'commit' && mode === '160000');
-			if (!validMode || paths.has(path))
-				throw new UnavailableError('Invalid Azure DevOps tree entry');
-			paths.add(path);
-			const objectId = normalizeProviderCommit(stringField(entry, 'objectId'));
-			if (type === 'tree') continue;
-			const size = entry.size;
-			if (
-				size !== undefined &&
-				(typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0)
-			)
-				throw new UnavailableError('Invalid Azure DevOps file size');
-			tree.set(path, { objectId, mode, size: typeof size === 'number' ? size : undefined });
+			tree.add({
+				path: stringField(entry, 'relativePath'),
+				type: stringField(entry, 'gitObjectType'),
+				mode: entry.mode,
+				objectId: entry.objectId,
+				size: entry.size,
+			});
 		}
-		return tree;
+		return tree.build();
 	}
 	async blob(
 		entry: TreeEntry,
 		limit: number,
 		options: SourceReadOptions = {},
+	): Promise<Uint8Array> {
+		const bytes = await this.unverifiedBlob(entry, limit, options);
+		assertBlobContents(bytes, entry.objectId, 'Azure DevOps');
+		return bytes;
+	}
+	// readTreeWorkspace verifies blob contents itself.
+	private async unverifiedBlob(
+		entry: TreeEntry,
+		limit: number,
+		options: SourceReadOptions,
 	): Promise<Uint8Array> {
 		if (entry.size !== undefined && entry.size > limit)
 			throw new BadRequestError('Azure DevOps file exceeds the workspace limit');
@@ -79,10 +74,7 @@ export class AzureTrees {
 			{ $format: 'octetstream' },
 			{ ...options, headers: { accept: 'application/octet-stream' } },
 		);
-		const bytes = await boundedBytes(response, limit, options.signal);
-		if (blobId(bytes) !== entry.objectId)
-			throw new UnavailableError('Azure DevOps returned different blob contents');
-		return bytes;
+		return boundedBytes(response, limit, options.signal);
 	}
 	async workspace(
 		commit: string,
@@ -93,13 +85,10 @@ export class AzureTrees {
 			provider: 'Azure DevOps',
 			rootPath,
 			tree: () => this.files(commit, options),
-			blob: (entry, limit) => this.blob(entry, limit, options),
+			blob: (entry, limit) => this.unverifiedBlob(entry, limit, options),
 		});
 	}
 
-	desired(base: FileTree, changes: readonly SourceControlChange[]): FileTree {
-		return applyChanges(base, changes);
-	}
 	async delta(
 		current: FileTree,
 		desired: FileTree,

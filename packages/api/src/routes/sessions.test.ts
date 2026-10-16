@@ -53,7 +53,7 @@ import {
 	expectPage,
 	makeTestWif,
 } from '../testing';
-import type { TestWifOptions } from '../testing';
+import type { TestApiOptions, TestWifOptions } from '../testing';
 import { makeFakeSnapshotCompute } from '../testing/snapshotCompute';
 
 const STRANGER = uid('user_stranger');
@@ -4263,12 +4263,15 @@ describe('Session routes', () => {
 					...(await goodExchange()),
 					expiration,
 				})),
+				userId = ACTOR,
+				subject?: TestApiOptions['subject'],
 			) => {
 				await enableFederation();
 				const { instance, calls } = makeFakeSandbox();
 				const api = createTestApi({
 					bucket,
-					userId: ACTOR,
+					userId,
+					subject,
 					compute: fakeComputeFrom(instance),
 					deps: {
 						sandbox: sandboxConfig({ appBaseUrl: 'https://hub.example.com' }),
@@ -4281,12 +4284,17 @@ describe('Session routes', () => {
 					},
 				});
 				const session = await expectOk<ApiSession>(await api.request('POST', sessionsPath()));
+				// Let the launch prime settle so each test counts only its own exchanges.
+				await vi.waitFor(() => expect(exchange).toHaveBeenCalled());
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				exchange.mockClear();
 				const env = calls.setEnvVars.find((vars) => vars.AWS_CONTAINER_CREDENTIALS_FULL_URI)!;
 				const signToken = (overrides: Partial<WifCredentialsTokenClaims>) =>
 					mintWifCredentialsToken(api.deps.wif!.credentialsEndpoint!.keyMaterial, {
 						projectId: pid,
 						sessionId: session.session_id,
-						userId: ACTOR,
+						userId,
+						subject: { email: `${userId}@example.com`, credential: { kind: 'development' } },
 						...overrides,
 					});
 				const fetchCreds = (authorization?: string) => {
@@ -4299,14 +4307,30 @@ describe('Session routes', () => {
 			};
 
 			it('injects the endpoint and a session token instead of static keys', async () => {
-				const { calls, exchange, env } = await endpointApi();
+				const { calls, env } = await endpointApi();
 				expect(new URL(env.AWS_CONTAINER_CREDENTIALS_FULL_URI).pathname).toBe(
 					'/api/wif/v1/credentials',
 				);
 				expect(env.AWS_CONTAINER_AUTHORIZATION_TOKEN).toBeTruthy();
 				expect(env.AWS_REGION).toBe('eu-west-1');
 				expect(calls.setEnvVars.flatMap(Object.keys)).not.toContain('AWS_ACCESS_KEY_ID');
+			});
+
+			it('primes the cache at launch so the first fetch needs no exchange', async () => {
+				const { exchange, fetchCreds } = await endpointApi();
+				expect((await fetchCreds()).status).toBe(200);
 				expect(exchange).not.toHaveBeenCalled();
+			});
+
+			it('starts the session even when the launch prime fails', async () => {
+				const exchange = vi
+					.fn()
+					.mockRejectedValueOnce(new Error('broker down'))
+					.mockResolvedValue({ accessKeyId: 'AK', secretAccessKey: 'SK', expiration });
+				const { fetchCreds, session } = await endpointApi(exchange);
+				expect(session.status).toBe('running');
+				expect((await fetchCreds()).status).toBe(200);
+				expect(exchange).toHaveBeenCalledOnce();
 			});
 
 			it('serves container credentials and reuses cached credentials', async () => {
@@ -4322,7 +4346,54 @@ describe('Session routes', () => {
 					Expiration: expiration,
 				});
 				expect((await fetchCreds()).status).toBe(200);
-				expect(exchange).toHaveBeenCalledTimes(1);
+				expect(exchange).not.toHaveBeenCalled();
+			});
+
+			it('accepts a Bearer-prefixed token', async () => {
+				const { fetchCreds, env } = await endpointApi();
+				expect((await fetchCreds(`Bearer ${env.AWS_CONTAINER_AUTHORIZATION_TOKEN}`)).status).toBe(
+					200,
+				);
+			});
+
+			it('serves a session that is still starting', async () => {
+				const { fetchCreds, session } = await endpointApi();
+				const key = paths.session(pid, session.session_id as SessionId);
+				const stored = JSON.parse(await (await bucket.get(key))!.text()) as Record<string, unknown>;
+				await bucket.put(key, JSON.stringify({ ...stored, status: 'starting' }));
+				expect((await fetchCreds()).status).toBe(200);
+			});
+
+			it('rejects a session whose sandbox was reclaimed', async () => {
+				const { fetchCreds, session } = await endpointApi();
+				await createServices(bucket).sessions.markSandboxReclaimed(
+					pid,
+					session.session_id as SessionId,
+					new Date().toISOString(),
+				);
+				await expectError(await fetchCreds(), 403, 'FORBIDDEN');
+			});
+
+			it('stops minting for a removed member and resumes once re-added', async () => {
+				await createServices(bucket).projects.addMember(
+					pid,
+					{ user_id: STRANGER },
+					'editor',
+					ACTOR,
+				);
+				const { fetchCreds, exchange } = await endpointApi(undefined, STRANGER);
+				expect((await fetchCreds()).status).toBe(200);
+				await createServices(bucket).projects.removeMember(pid, STRANGER, ACTOR);
+				await expectError(await fetchCreds(), 403, 'FORBIDDEN');
+				await createServices(bucket).projects.addMember(
+					pid,
+					{ user_id: STRANGER },
+					'editor',
+					ACTOR,
+				);
+				expect((await fetchCreds()).status).toBe(200);
+				// The deny evicted the cached credentials too.
+				expect(exchange).toHaveBeenCalledOnce();
 			});
 
 			it.each([undefined, 'invalid', '2020-01-01T00:00:00Z'])(
@@ -4340,7 +4411,7 @@ describe('Session routes', () => {
 				async (cached) => {
 					const { fetchCreds, exchange, session } = await endpointApi();
 					if (cached) expect((await fetchCreds()).status).toBe(200);
-					const deadline = Date.now() + 1_000;
+					const deadline = Date.now() + Millis.seconds(10);
 					await createServices(bucket).sessions.tightenAuthorizationDeadline(
 						pid,
 						session.session_id,
@@ -4348,7 +4419,7 @@ describe('Session routes', () => {
 					);
 					vi.spyOn(Date, 'now').mockReturnValue(deadline);
 					expect((await fetchCreds()).status).toBe(403);
-					expect(exchange).toHaveBeenCalledTimes(cached ? 1 : 0);
+					expect(exchange).not.toHaveBeenCalled();
 				},
 			);
 
@@ -4357,7 +4428,7 @@ describe('Session routes', () => {
 				expect((await fetchCreds()).status).toBe(200);
 				await deps.services.identities.setSuspension(ACTOR, true);
 				expect((await fetchCreds()).status).toBe(403);
-				expect(exchange).toHaveBeenCalledOnce();
+				expect(exchange).not.toHaveBeenCalled();
 			});
 
 			it('bounds session authorization by token expiry even when its lifetime is extended', async () => {
@@ -4382,6 +4453,28 @@ describe('Session routes', () => {
 				expect(
 					(await services.sessions.getSession(pid, session.session_id)).authorization_expires_at,
 				).toBe(stored.authorization_expires_at);
+			});
+
+			it('bounds the token and session by an expiring launch credential', async () => {
+				const credentialExpiresAt = Date.now() + 2 * 60 * 60_000;
+				const { env, session, fetchCreds } = await endpointApi(undefined, ACTOR, {
+					credential: {
+						kind: 'development',
+						expiresAt: new Date(credentialExpiresAt).toISOString(),
+					},
+				});
+				const claims = JSON.parse(
+					Buffer.from(env.AWS_CONTAINER_AUTHORIZATION_TOKEN.split('.')[1], 'base64url').toString(),
+				) as { exp: number };
+				expect(claims.exp * 1000).toBeLessThanOrEqual(credentialExpiresAt);
+				const stored = await createServices(bucket).sessions.getSession(pid, session.session_id);
+				expect(Date.parse(stored.authorization_expires_at!)).toBeLessThanOrEqual(
+					credentialExpiresAt,
+				);
+				expect((await fetchCreds()).status).toBe(200);
+				// The token expires no later than the session deadline, so it is rejected first.
+				vi.spyOn(Date, 'now').mockReturnValue(credentialExpiresAt);
+				await expectError(await fetchCreds(), 401, 'UNAUTHORIZED');
 			});
 
 			it('rejects a missing or forged token', async () => {
@@ -4438,8 +4531,8 @@ describe('Session routes', () => {
 					if (source === 'project')
 						vi.spyOn(deps.services.projects, 'getProject').mockRejectedValueOnce(error);
 					await expectError(await fetchCreds(), 503, 'SERVICE_UNAVAILABLE');
-					expect(exchange).toHaveBeenCalledOnce();
 					expect((await fetchCreds()).status).toBe(200);
+					expect(exchange).not.toHaveBeenCalled();
 				},
 			);
 
@@ -4450,7 +4543,7 @@ describe('Session routes', () => {
 				await expectError(await fetchCreds(), 403, 'FORBIDDEN');
 				await deps.services.identities.setSuspension(ACTOR, false);
 				expect((await fetchCreds()).status).toBe(200);
-				expect(exchange).toHaveBeenCalledTimes(2);
+				expect(exchange).toHaveBeenCalledOnce();
 			});
 
 			it('stops serving once the session ends', async () => {
@@ -4473,12 +4566,36 @@ describe('Session routes', () => {
 			it('reports an exchange failure as unavailable and retries next time', async () => {
 				const exchange = vi
 					.fn()
+					.mockRejectedValueOnce(new Error('prime denied'))
 					.mockRejectedValueOnce(new Error('policy denied'))
 					.mockResolvedValue({ accessKeyId: 'AK', secretAccessKey: 'SK', expiration });
 				const { fetchCreds } = await endpointApi(exchange);
 				expect((await fetchCreds()).status).toBe(503);
 				expect((await fetchCreds()).status).toBe(200);
 			});
+		});
+
+		it("never injects the credentials endpoint into a viewer's ephemeral session", async () => {
+			await enableFederation();
+			const exchange = vi.fn(goodExchange);
+			const { instance, calls } = makeFakeSandbox();
+			const req = createTestApi({
+				bucket,
+				userId: uid('user_viewer'),
+				compute: fakeComputeFrom(instance),
+				deps: {
+					sandbox: sandboxConfig({ appBaseUrl: 'https://hub.example.com' }),
+					wif: makeTestWif({ exchange, credentialsEndpoint: true }),
+					policy: { defaultRole: 'viewer', viewerMode: 'ephemeral-sandbox' },
+				},
+			}).request;
+
+			const data = await expectOk<ApiSession>(await req('POST', sessionsPath()));
+			expect(data.ephemeral).toBe(true);
+			expect(
+				calls.setEnvVars.flatMap(Object.keys).filter((name) => name.startsWith('AWS_')),
+			).toEqual([]);
+			expect(exchange).not.toHaveBeenCalled();
 		});
 
 		it('does not inject creds when WIF is unconfigured at the deployment', async () => {

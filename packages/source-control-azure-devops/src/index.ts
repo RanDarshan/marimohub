@@ -1,3 +1,4 @@
+import { deadlineSignal } from '@marimo-hub/core/async';
 import { createPublishStage } from '@marimo-hub/source-control-git/publication';
 import {
 	BadRequestError,
@@ -20,14 +21,16 @@ import { AzureClient, record, stringField, values } from './client';
 import type { AzureDevOpsOptions, AzureDevOpsRuntime } from './client';
 import { parseAzureRepository } from './repository';
 import type { AzureRepository } from './repository';
-import { AzureTrees, sameTree } from './trees';
-import type { FileTree } from './trees';
+import { AzureTrees } from './trees';
+import { applyChanges, sameTree } from '@marimo-hub/source-control-git/file-tree';
+import type { FileTree } from '@marimo-hub/source-control-git/file-tree';
 import {
+	coAuthorTrailer,
 	validateBranch,
 	normalizeCommit,
 	normalizeProviderCommit,
 	validatePublication,
-} from './validation';
+} from '@marimo-hub/source-control-git/validation';
 export { parseAzureRepository, validateOrganization } from './repository';
 export type { AzureDevOpsOptions, AzureDevOpsRuntime, AzureCredential } from './client';
 export { ClientSecretCredential } from '@azure/identity';
@@ -80,31 +83,30 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 			options,
 		);
 	}
-	async fetchGitDirectory(repository: string, commit: string, branch: string) {
+	async fetchGitDirectory(
+		repository: string,
+		commit: string,
+		branch: string,
+		options: SourceReadOptions = {},
+	) {
 		const normalizedCommit = normalizeCommit(commit);
 		validateBranch(branch);
 		const repo = this.repository(repository);
+		let authorization: string;
+		try {
+			authorization = await this.client.authorization(deadlineSignal(60_000, options.signal));
+		} catch (error) {
+			options.signal?.throwIfAborted();
+			throw error;
+		}
 		return materializeGitDirectory({
 			repository: repo.url,
 			remoteUrl: repo.url,
 			commit: normalizedCommit,
 			branch,
-			authorization: await this.client.authorization(),
-			fetcher: (url, init) => {
-				const target = new URL(url);
-				if (
-					target.origin !== new URL(repo.url).origin ||
-					!target.pathname.startsWith(`${new URL(repo.url).pathname}/`) ||
-					target.username ||
-					target.password
-				)
-					throw new BadRequestError('Invalid Azure DevOps Git endpoint');
-				return this.client.fetcher(url, {
-					...init,
-					redirect: 'error',
-					signal: AbortSignal.timeout(60_000),
-				});
-			},
+			authorization,
+			fetcher: this.client.fetcher,
+			signal: options.signal,
 		});
 	}
 	private branchChanged(deleted = false): Error {
@@ -166,10 +168,9 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 		input: OpenChangeRequestInput | UpdateChangeRequestInput,
 		changes: unknown[],
 	): Promise<string> {
-		const trailer = input.coAuthor
-			? `Co-authored-by: ${input.coAuthor.name.trim()} <${input.coAuthor.email}>`
-			: '';
-		const comment = [input.title, input.body, trailer].filter(Boolean).join('\n\n');
+		const comment = [input.title, input.body, coAuthorTrailer(input.coAuthor)]
+			.filter(Boolean)
+			.join('\n\n');
 		const payload = await this.client.json(
 			repo,
 			'/pushes',
@@ -193,7 +194,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 		const trees = new AzureTrees(this.client, repo);
 		const { desired, changes } = await this.stage('push', async () => {
 			const base = await trees.files(baseCommit);
-			const desired = trees.desired(base, input.changes);
+			const desired = applyChanges(base, input.changes);
 			const changes = await trees.delta(base, desired, input.changes);
 			if (changes.length === 0) throw new ConflictError('Proposal contains no changes');
 			return { desired, changes };
@@ -302,7 +303,7 @@ export class AzureDevOpsSourceControl implements SourceControlReader, SourceCont
 			throw new ConflictError('Azure DevOps pull request is closed; create a new pull request');
 		const trees = new AzureTrees(this.client, repo);
 		const desired = await this.stage('push', async () =>
-			trees.desired(await trees.files(baseCommit), input.changes),
+			applyChanges(await trees.files(baseCommit), input.changes),
 		);
 		let head = await this.stage('branch', () => this.head(repo, branch));
 		if (!head) throw this.branchChanged(true);

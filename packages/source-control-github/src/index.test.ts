@@ -1631,7 +1631,9 @@ describe('GitHubAppPublisher', () => {
 			const fetcher = vi.fn(async (url: string) =>
 				url.endsWith('/installation') ? response({ id: 42 }) : response(tokenPayload),
 			);
-			await expect(publisher(fetcher).openChangeRequest(input)).rejects.toThrow('invalid token');
+			await expect(publisher(fetcher).openChangeRequest(input)).rejects.toThrow(
+				'Invalid GitHub token',
+			);
 			expect(fetcher).toHaveBeenCalledTimes(2);
 		},
 	);
@@ -1973,5 +1975,26 @@ describe('GitHubAppPublisher', () => {
 			tree: [{ path: 'apps/old.py', mode: '100755', type: 'blob', sha: null }],
 		});
 		expect(fetcher.mock.calls.some(([url]) => url.endsWith('/git/blobs'))).toBe(false);
+	});
+});
+
+describe('GitHubAppPublisher.fetchGitDirectory', () => {
+	it('honors caller cancellation while acquiring the installation token', async () => {
+		const fetcher = vi.fn((_url: string, init?: RequestInit) => {
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+			});
+		});
+		const caller = new AbortController();
+		const reason = new Error('Canceled by caller');
+		const pending = publisher(fetcher).fetchGitDirectory('owner/repo', 'a'.repeat(40), 'main', {
+			signal: caller.signal,
+		});
+		await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+		caller.abort(reason);
+		await expect(pending).rejects.toBe(reason);
+		expect(new URL(fetcher.mock.calls[0]?.[0] ?? '').pathname).toBe(
+			'/repos/owner/repo/installation',
+		);
 	});
 });

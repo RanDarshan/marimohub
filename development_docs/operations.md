@@ -82,65 +82,21 @@ the index.
 
 ### Inspect and recover the catalog
 
-**Keep all writers stopped through inspection and apply:** API replicas,
-maintenance workers, scheduled triggers, and sandbox processes that persist
-notebook changes. The final CAS protects the catalog pointer, not individual
-metadata records.
+The operator runbook, flags, exit codes, and recovery limits are in
+[catalog recovery](../docs/operations.md#catalog-recovery). Run the command from a
+checkout with `pnpm --filter @marimo-hub/server catalog:recover`, or from the image
+with `node dist/catalog-recovery.mjs`. The SEA binaries have no recovery entrypoint.
+Other adapters can call `CatalogService.planRecovery` and `CatalogService.recover`.
 
-1. Back up the affected storage.
-2. Set the deployment's `MARIMOHUB_STORAGE_*` environment variables.
-3. From the repository root, generate a dry-run report:
+Writers must stay stopped through inspection and apply because the final CAS
+protects only the catalog pointer, not individual metadata records.
 
-   ```bash
-   pnpm --filter @marimo-hub/server catalog:recover --rebuild
-   ```
-
-4. Review `candidates`, `projects`, and `issues` in the JSON report.
-5. If a suitable snapshot survives, inspect it with its actual ID:
-
-   ```bash
-   pnpm --filter @marimo-hub/server catalog:recover --snapshot SNAPSHOT_ID
-   ```
-
-   Prefer a suitable `current` or `previous` candidate. An `unverified` snapshot
-   can be an uncommitted write. Neither creation time nor key order proves commit.
-
-6. Apply the report with its exact `token` and the same mode:
-
-   ```bash
-   pnpm --filter @marimo-hub/server catalog:recover \
-     --snapshot SNAPSHOT_ID --apply REPORT_TOKEN \
-     --writers-stopped --actor OPERATOR_ID
-   ```
-
-   For record reconstruction, use `--rebuild` instead of `--snapshot SNAPSHOT_ID`.
-   Rebuild always warns that record discovery cannot prove publication.
-   After reviewing and accepting this warning, add `--accept-warnings` to the rebuild apply command.
-   Snapshot reports with accepted warnings also require `--accept-warnings`. Errors always block apply.
-   Changed storage invalidates the token. If apply fails, inspect again before retrying.
-
-7. Check recovered projects and notebook contents before restarting writers.
-
-The command defaults to dry-run and supports `s3`, `gcs`, `azure`, and `fs`.
-The server bundle provides `node dist/catalog-recovery.mjs` with the same arguments.
-Other adapters can use `CatalogService.planRecovery` and `CatalogService.recover`.
-
-### Recovery limits
-
-- **Snapshot mode** restores selected membership with current metadata, including
-  deletion status, permissions, security labels, and job schedules.
-- **Rebuild mode** discovers surviving records but cannot prove publication.
-  Review every entry: failed creates and expired import receipts can leave
-  ambiguous records.
-- Preview runtimes, known incomplete import attempts, and jobs with deletion
-  fences are excluded. Deleted projects and notebooks retain their status.
-- Missing or invalid metadata, referenced notebook content, or job history
-  indexes block apply. Recovery does not repair these objects or restore history.
-
-Recovery writes a new immutable snapshot through `CatalogService.mutateSnapshot`.
-It updates an existing pointer with its inspected ETag or creates a missing pointer
-conditionally. It does not retry against changed state. Uncertain write responses
-leave the snapshot intact for inspection.
+Recovery writes a new immutable snapshot and commits it through the private
+`CatalogService.commitRecovery`, which only `recover()` reaches. It updates an
+existing pointer with its inspected ETag or creates a missing pointer
+conditionally. It does not retry against changed state. A lost CAS deletes the
+new snapshot and fails with a conflict. Uncertain write responses leave the
+snapshot intact for inspection.
 
 ---
 
@@ -177,6 +133,11 @@ settles. A stalled attempt does not release its lease; the lease
 expires at the deadline. Another replica can then take the lease while the
 abandoned work is still running, so calls without cancellation support still
 need adapter request timeouts.
+
+When a shutdown starts, the maintenance cycle finishes its current step, skips
+the remaining steps, and releases its lease, so a replacement replica does not
+wait for the lease to expire. See
+[shutdown budgets](../docs/operations.md#shutdown-budgets).
 
 Lease-release errors log as `<loop>_release_failed` and preserve the attempt's
 outcome. Skipped attempts (`shouldRun` false or lease held elsewhere) count as

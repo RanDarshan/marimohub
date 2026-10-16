@@ -1,16 +1,13 @@
 import fs from 'node:fs';
 import git from 'isomorphic-git';
 import type { TreeEntry as GitTreeEntry } from 'isomorphic-git';
-import {
-	BadRequestError,
-	ConflictError,
-	DomainError,
-	UnavailableError,
-} from '@marimo-hub/core/errors';
-import { isSafeWorkspaceRootPath, WORKSPACE_LIMITS } from '@marimo-hub/core/remote-workspace';
-import { assertGitTreeLimits, gitHttp, withFetchedGit } from './index';
+import { BadRequestError, ConflictError } from '@marimo-hub/core/errors';
+import { WORKSPACE_LIMITS } from '@marimo-hub/core/remote-workspace';
+import { assertGitTreeLimits, gitTransport, withFetchedGit } from './index';
 import type { GitFetchOptions } from './index';
+import { isSafeGitTreePath } from './fileTree';
 import type { FileTree } from './fileTree';
+import { PUSH_GIT_TRANSPORT_TIMEOUTS, gitTransportError } from './transport';
 import { normalizeCommit, validateBranch } from './validation';
 
 export async function pushGitTree(
@@ -34,7 +31,7 @@ export async function pushGitTree(
 		const directories = new Map<string, GitTreeEntry[]>([['', []]]);
 		let total = 0;
 		for (const [path, entry] of options.tree) {
-			if (!path || !isSafeWorkspaceRootPath(path)) throw new BadRequestError('Invalid Git path');
+			if (!isSafeGitTreePath(path)) throw new BadRequestError('Invalid Git path');
 			const parts = path.split('/');
 			for (let length = 1; length < parts.length; length++) {
 				const folder = parts.slice(0, length).join('/');
@@ -100,11 +97,12 @@ export async function pushGitTree(
 			force: true,
 		});
 		await assertGitTreeLimits(dir, commit, options.repository);
+		const http = gitTransport({ ...options, timeouts: PUSH_GIT_TRANSPORT_TIMEOUTS });
 		const result = await git
 			.push({
 				fs,
 				dir,
-				http: gitHttp(options.fetcher, options.repository),
+				http,
 				url: options.remoteUrl,
 				ref: `refs/heads/${options.headBranch}`,
 				remoteRef: `refs/heads/${options.headBranch}`,
@@ -122,8 +120,8 @@ export async function pushGitTree(
 					error instanceof git.Errors.PushRejectedError
 				)
 					throw new ConflictError('Git server rejected the proposal branch update');
-				if (error instanceof DomainError) throw error;
-				throw new UnavailableError('Git proposal branch could not be pushed', { cause: error });
+				options.signal?.throwIfAborted();
+				throw gitTransportError(error, 'Git proposal branch could not be pushed', http);
 			});
 		if (!result.ok || !result.refs[`refs/heads/${options.headBranch}`]?.ok)
 			throw new ConflictError('Git server rejected the proposal branch update');

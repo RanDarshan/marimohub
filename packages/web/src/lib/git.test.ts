@@ -365,10 +365,24 @@ describe('configured pull providers', () => {
 describe('Azure repository identity', () => {
 	it.each([
 		'https://code.example.com/collection/project/_git/repo',
-		'https://acme.visualstudio.com/project/_git/repo',
 		'https://dev.azure.com:8443/acme/project/_git/repo',
 		'http://dev.azure.com/acme/project/_git/repo',
 	])('does not trust an Azure claim for an unsupported origin: %s', (repo) => {
+		expect(gitCoords(gitSource({ provider: 'azure-devops', repo }))).toBeNull();
+	});
+
+	it('accepts and canonicalizes the clone form', () => {
+		const repo = 'https://acme@dev.azure.com/acme/project/_git/repo';
+		expect(isAzureDevOpsRepoInput(repo)).toBe(true);
+		expect(pullRepositoryInput(['azure-devops']).validate(repo)).toBe(true);
+	});
+
+	it.each([
+		'https://acme.visualstudio.com/project/_git/repo',
+		'git@ssh.dev.azure.com:v3/acme/project/repo',
+	])('does not recognize the Azure form %s', (repo) => {
+		expect(isAzureDevOpsRepoInput(repo)).toBe(false);
+		expect(pullRepositoryInput(['azure-devops']).validate(repo)).toBe(false);
 		expect(gitCoords(gitSource({ provider: 'azure-devops', repo }))).toBeNull();
 	});
 

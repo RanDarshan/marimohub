@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { TempS3Creds } from '@marimo-hub/core';
-import { WifCredentialCache } from './wifCredentialCache';
+import { makeTestWif } from './testing';
+import { WifCredentialCache, wifCredentialCacheFor } from './wifCredentialCache';
 
 const MINUTE = 60_000;
 
@@ -158,5 +159,13 @@ describe('WifCredentialCache', () => {
 		cache.delete('one');
 		expect(await cache.get('two', exchange)).toEqual(second);
 		expect((await cache.get('one', exchange)).accessKeyId).toBe('AK3');
+	});
+});
+
+describe('wifCredentialCacheFor', () => {
+	it('shares one cache per WIF config', () => {
+		const a = makeTestWif();
+		expect(wifCredentialCacheFor(a)).toBe(wifCredentialCacheFor(a));
+		expect(wifCredentialCacheFor(makeTestWif())).not.toBe(wifCredentialCacheFor(a));
 	});
 });

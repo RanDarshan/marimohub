@@ -5,6 +5,7 @@ import type { ApiDeps } from '@marimo-hub/api';
 import { InFlightWork, withAbortSignal, withDeadline } from '@marimo-hub/core';
 import type { MaintenanceLock, Metrics } from '@marimo-hub/core';
 import { logEvent } from './log';
+import { settleEach } from './promise';
 
 type LoopHealthReport = ReturnType<NonNullable<ApiDeps['loopHealth']>>;
 type LoopHealth = LoopHealthReport['loops'][string];
@@ -34,7 +35,9 @@ interface LoopContext {
 	holder: string | undefined;
 	signal: AbortSignal;
 	/**
-	 * Run `work`, skipping it (and every later step) once the attempt is aborted.
+	 * Run `work`, skipping it (and every later step) once the attempt is aborted or
+	 * the loop is stopped. Stopping never interrupts the step in flight, so the
+	 * attempt still releases its lease when that step settles.
 	 * The step is not raced against the signal: work that ignores the signal holds
 	 * the attempt, and so the in-flight guard, until it settles, so a hung sweep
 	 * cannot overlap its successor.
@@ -69,6 +72,10 @@ class LoopDeadlineError extends Error {
 	override name = 'LoopDeadlineError';
 }
 
+class LoopStoppedError extends Error {
+	override name = 'LoopStoppedError';
+}
+
 function logFailure(event: string, error: unknown, fields: Record<string, unknown> = {}) {
 	logEvent({
 		level: 'error',
@@ -87,7 +94,7 @@ export class BackgroundLoops {
 	/** Call after stopping ticks; includes work still settling after a deadline. */
 	async drain(): Promise<void> {
 		await this.inFlight.drain();
-		await Promise.allSettled([...this.serviceDrains].map((drain) => Promise.resolve().then(drain)));
+		await settleEach(this.serviceDrains);
 	}
 
 	constructor(private readonly metrics?: Metrics) {}
@@ -127,6 +134,7 @@ export class BackgroundLoops {
 				signal,
 				async step(fn) {
 					signal.throwIfAborted();
+					if (state.stopped) throw new LoopStoppedError(`${name} stopped`);
 					const result = await fn();
 					signal.throwIfAborted();
 					return result;
@@ -144,6 +152,8 @@ export class BackgroundLoops {
 				return undefined;
 			}
 			try {
+				// A stop that landed while a setup step was pending must still release the lease.
+				if (state.stopped) throw new LoopStoppedError(`${name} stopped`);
 				return { value: await options.run(context) };
 			} finally {
 				// After a deadline, leave the lease to expire instead of releasing it late.
@@ -184,9 +194,16 @@ export class BackgroundLoops {
 					outcome = result ? 'success' : 'skipped';
 				} catch (err) {
 					error = err;
-					outcome = err instanceof LoopDeadlineError ? 'stalled' : 'failed';
+					outcome =
+						err instanceof LoopDeadlineError
+							? 'stalled'
+							: err instanceof LoopStoppedError
+								? 'skipped'
+								: 'failed';
 				}
-				const cancelled = outcome === 'failed' && stopping.signal.aborted;
+				// A stop is not progress: recording it would reset failures and fake a success.
+				const cancelled =
+					error instanceof LoopStoppedError || (outcome === 'failed' && stopping.signal.aborted);
 				if (cancelled) outcome = 'skipped';
 				const report = (fn: () => void) => {
 					try {

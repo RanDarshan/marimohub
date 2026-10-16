@@ -169,8 +169,8 @@ limit.
 
 Use a full HTTPS URL, including any nested groups: `https://gitlab.com/group/subgroup/project`.
 
-1. Create a project, group, or personal access token with the `api` and `write_repository` scopes.
-   The token identity needs **Developer** access and permission to push proposal branches.
+1. Create a project or group access token with the `api` and `write_repository` scopes, for an identity with **Developer** access that can push proposal branches.
+   A personal access token also works, but its `api` scope reaches every project its user can access.
 2. Set the token and [repository policy](#repository-project-policies) on the Hub server:
 
    ```bash
@@ -193,9 +193,10 @@ See GitLab's [access token scopes](https://docs.gitlab.com/security/tokens/acces
 
 ## Azure DevOps Services
 
-Use full HTTPS URLs: `https://dev.azure.com/organization/project/_git/repository`.
+Use the hosted HTTPS URL, `https://dev.azure.com/organization/project/_git/repository`,
+or the portal clone URL, `https://organization@dev.azure.com/organization/project/_git/repository`.
 This adapter supports hosted Azure DevOps Services only.
-Azure DevOps Server, `visualstudio.com` aliases, SSH, PATs, webhooks, and notebook previews are not supported.
+Azure DevOps Server, `visualstudio.com` URLs, SSH remotes, PATs, webhooks, and notebook previews are not supported.
 
 1. Add a Microsoft Entra service principal or managed identity to your Azure DevOps organization.
 2. Grant repository **Read**, **Contribute**, **Create branch**, and **Contribute to pull requests** permissions.
@@ -215,6 +216,7 @@ Azure DevOps Server, `visualstudio.com` aliases, SSH, PATs, webhooks, and notebo
    ```
 
    Otherwise, omit all three to use `DefaultAzureCredential`, including managed identity, workload identity, or local Azure CLI credentials.
+   It reads the same `AZURE_*` environment as Azure storage and object browsing, so they share one identity.
 
 5. Restart Hub and open **Add a git repository**.
 6. Select the connection option and enter the repository URL, branch, folder, and notebook file.
@@ -563,13 +565,6 @@ supplies the `github` provider automatically. On creation, `owner/repo` still
 means github.com; when editing a source, shorthand keeps its current host.
 [Notebook previews](notebook-previews.md) use the same host.
 
-::: warning Set a repository policy
-Without `MARIMOHUB_SOURCE_CONTROL_GITHUB_ALLOWED_REPOSITORIES`, every project can
-reach every repository the App installation can access. An App installed across a
-whole GHES organization or instance therefore exposes all of those repositories.
-Set [repository project policies](#repository-project-policies) to limit each project.
-:::
-
 marimohub sends REST requests to `{origin}/api/v3` for any host other than
 github.com. GHE.com data-residency tenants are not supported yet.
 
@@ -586,6 +581,11 @@ host; use the Node server on a network with access to GHES.
 
 <span id="github-project-policies"></span>
 
+::: warning Set a repository policy for each provider
+Without a policy, every project can reach every repository the provider credential can access.
+A GitHub App installed across an organization or GHES instance, a group or personal GitLab token, or an organization-wide Azure identity exposes all of those repositories.
+:::
+
 Each provider has an independent `ALLOWED_REPOSITORIES` policy for its shared credentials:
 
 | Provider     | Variable                                                     | Repository format                                                        |
@@ -598,10 +598,10 @@ Each provider has an independent `ALLOWED_REPOSITORIES` policy for its shared cr
 [{ "resource": "https://github.com/team/notebooks", "projects": ["proj-0000000000000000"] }]
 ```
 
-- `resource` matches a canonical repository URL. GitHub and Azure DevOps ignore path case; GitLab preserves it. `"*"` permits any repository accessible to the provider identity.
+- `resource` matches a canonical repository URL. Matching ignores case for all providers. `"*"` permits any repository accessible to the provider identity.
 - `projects` lists project IDs. `"*"` shares the repository across projects.
 - `[]` denies all access. An unset or blank policy permits shared access and emits a startup warning.
 - Invalid policies stop startup. Restart Hub to apply changes.
 
-Policies cover branch checks, workspace and Git downloads, preview reads, and PR creation and updates.
+Policies cover branch checks, workspace and Git downloads, preview reads, and the creation and update of pull requests and merge requests.
 The provider identity must also have repository access. These policies do not restrict user-supplied credentials.
