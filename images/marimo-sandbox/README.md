@@ -1,9 +1,10 @@
 # Maintained sandbox image
 
-All targets require the `notebook_bridge` named build context to preinstall the
-bundled notebook bridge. Older build commands without this context fail.
+The manifest tags `latest`, `py3.13-marimo<version>`, and `sha-<commit>` support
+`linux/amd64` and `linux/arm64`, as do their `-vscode`, `-opencode`, and `-tools` variants.
+Source tags ending in `-amd64` or `-arm64` contain only that architecture.
 
-From the repository root, use:
+Build from the repository root with the required `notebook_bridge` context:
 
 ```sh
 docker build --build-context notebook_bridge=packages/notebook-bridge \
