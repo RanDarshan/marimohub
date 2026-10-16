@@ -55,8 +55,9 @@ Pitfalls:
 - Restoring the pointer alone, to a snapshot that was later pruned by retention
   (§5), yields a dangling pointer — see §2.
 - Restoring the index to time _T_ does **not** roll back `notebook.py`, which is
-  overwritten in place. To roll back code you must also restore the relevant
-  immutable `versions/{vid}/` objects (or rely on object versioning).
+  overwritten in place. For local notebooks, use the version-restore operation.
+  It copies the selected version's code and dependencies into the workspace and writes a new version.
+  Restoring immutable `versions/{vid}/` objects alone does not change the workspace.
 
 ### Test-restore procedure (do this before you need it)
 
@@ -71,39 +72,75 @@ Pitfalls:
 
 ## 2. Corruption recovery
 
-**Deletion invariant (state it, rely on it):** _a writer only ever deletes a
-snapshot it itself wrote and never committed._
+A missing catalog returns `NOT_INITIALIZED` with `Catalog recovery required` when
+project objects or snapshots remain. A missing current snapshot also blocks
+catalog reads. Only fresh storage initializes automatically.
 
-- The loser of a CAS race deletes the orphan snapshot it just wrote, before
-  retrying (`CatalogService.mutateSnapshot`, `initialize`).
-- Retention never deletes the snapshot `catalog.json` points at or its
-  `previous_snapshot_id` (`MaintenanceService.expireSnapshots`).
+Retention protects the current and previous snapshots. Older snapshots can
+expire, so recovery requires a surviving snapshot or enough records to rebuild
+the index.
 
-Because no code path deletes a _committed_ snapshot, the system can never orphan
-its own live pointer. Snapshots are immutable and independently named, which
-turns "the pointer points at a missing snapshot" (from an out-of-band deletion,
-a misfired cleanup, or a bug) into a clean, mechanical rollback rather than data
-loss.
+### Inspect and recover the catalog
 
-### Recover a dangling catalog pointer
+**Keep all writers stopped through inspection and apply:** API replicas,
+maintenance workers, scheduled triggers, and sandbox processes that persist
+notebook changes. The final CAS protects the catalog pointer, not individual
+metadata records.
 
-`GET /api/v1/projects` failing with a "snapshot not found" / `NotInitializedError`
-is the symptom: `catalog.json` names a snapshot that no longer exists.
+1. Back up the affected storage.
+2. Set the deployment's `MARIMOHUB_STORAGE_*` environment variables.
+3. From the repository root, generate a dry-run report:
 
-1. Read `_system/catalog.json` → note `current_snapshot_id` and
-   `previous_snapshot_id`.
-2. If `previous_snapshot_id` exists and its object is present, that is your
-   rollback target.
-3. Otherwise list `_system/snapshots/` and pick the newest surviving snapshot
-   **by `created_at` (or object `uploaded`), NOT by key order** — snapshot IDs
-   are random, not time-sortable (spec §5).
-4. Write the chosen snapshot back under a **new** ID, then CAS-swap
-   `catalog.json` to point at it (the normal commit path; do not hand-edit the
-   pointer past the CAS). This restores the index; restore content per §1 if the
-   loss extended to notebook objects.
+   ```bash
+   pnpm --filter @marimo-hub/server catalog:recover --rebuild
+   ```
 
-> Always go through the CAS path to update the pointer — never a plain `PUT` —
-> so a concurrent writer can't be clobbered mid-recovery.
+4. Review `candidates`, `projects`, and `issues` in the JSON report.
+5. If a suitable snapshot survives, inspect it with its actual ID:
+
+   ```bash
+   pnpm --filter @marimo-hub/server catalog:recover --snapshot SNAPSHOT_ID
+   ```
+
+   Prefer a suitable `current` or `previous` candidate. An `unverified` snapshot
+   can be an uncommitted write. Neither creation time nor key order proves commit.
+
+6. Apply the report with its exact `token` and the same mode:
+
+   ```bash
+   pnpm --filter @marimo-hub/server catalog:recover \
+     --snapshot SNAPSHOT_ID --apply REPORT_TOKEN \
+     --writers-stopped --actor OPERATOR_ID
+   ```
+
+   For record reconstruction, use `--rebuild` instead of `--snapshot SNAPSHOT_ID`.
+   Rebuild always warns that record discovery cannot prove publication.
+   After reviewing and accepting this warning, add `--accept-warnings` to the rebuild apply command.
+   Snapshot reports with accepted warnings also require `--accept-warnings`. Errors always block apply.
+   Changed storage invalidates the token. If apply fails, inspect again before retrying.
+
+7. Check recovered projects and notebook contents before restarting writers.
+
+The command defaults to dry-run and supports `s3`, `gcs`, `azure`, and `fs`.
+The server bundle provides `node dist/catalog-recovery.mjs` with the same arguments.
+Other adapters can use `CatalogService.planRecovery` and `CatalogService.recover`.
+
+### Recovery limits
+
+- **Snapshot mode** restores selected membership with current metadata, including
+  deletion status, permissions, security labels, and job schedules.
+- **Rebuild mode** discovers surviving records but cannot prove publication.
+  Review every entry: failed creates and expired import receipts can leave
+  ambiguous records.
+- Preview runtimes, known incomplete import attempts, and jobs with deletion
+  fences are excluded. Deleted projects and notebooks retain their status.
+- Missing or invalid metadata, referenced notebook content, or job history
+  indexes block apply. Recovery does not repair these objects or restore history.
+
+Recovery writes a new immutable snapshot through `CatalogService.mutateSnapshot`.
+It updates an existing pointer with its inspected ETag or creates a missing pointer
+conditionally. It does not retry against changed state. Uncertain write responses
+leave the snapshot intact for inspection.
 
 ---
 

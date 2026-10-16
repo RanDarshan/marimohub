@@ -417,3 +417,15 @@ Compute backends differ in cost model — pick per [Compute](/compute):
   orphan backstops.
 - `kubernetes` / `docker`: you own the nodes; cap per-kernel CPU/memory/GPU.
 - `MARIMOHUB_MAX_SESSIONS_PER_USER` bounds concurrent kernels per user.
+
+## Catalog recovery
+
+A missing current snapshot, or a missing catalog with existing data, requires recovery.
+Stop all writers, then inspect the storage with a dry-run:
+
+```bash
+pnpm --filter @marimo-hub/server catalog:recover --rebuild
+```
+
+Follow the [recovery runbook](https://github.com/marimo-team/marimohub/blob/main/development_docs/operations.md#inspect-and-recover-the-catalog)
+to select a snapshot or rebuild from records, review the report, and apply recovery.
