@@ -5,10 +5,10 @@ description: Exchange notebook session identity for short-lived cloud credential
 # Workload Identity Federation
 
 Give a project's notebooks access to cloud resources **without creating any long-lived access key**.
-marimohub becomes an OIDC issuer: per session it mints a short-lived,
-project-scoped token and exchanges it server-side for **temporary** cloud
-credentials, which it injects into the sandbox — they expire on their own.
-Nothing is stored: not in the hub, not in the sandbox, not in notebook code.
+marimohub acts as an OIDC issuer. It exchanges short-lived, project-scoped tokens
+for **temporary** cloud credentials. Sandboxes receive credentials through
+environment variables or the [refreshable credential provider](#refreshable-credentials).
+The hub does not persist exchanged cloud credentials, but endpoint delivery caches them in memory.
 
 The cloud side is selected by a **broker** (`MARIMOHUB_WIF_BROKER`):
 
@@ -20,6 +20,8 @@ The cloud side is selected by a **broker** (`MARIMOHUB_WIF_BROKER`):
 GCP is planned — see [the GCP example](#example-gcp-gcs-bigquery).
 
 ## How it works
+
+With the default `env` delivery:
 
 1. The hub publishes an OIDC discovery document and a public JWKS at
    `/.well-known/openid-configuration` and `/.well-known/jwks.json`. The issuer
@@ -38,7 +40,7 @@ GCP is planned — see [the GCP example](#example-gcp-gcs-bigquery).
 
 Because `sub` is the project id, **which project can reach what is decided by
 the cloud's policy** (a CAIOS access policy, an IAM trust policy) — granting or
-revoking access is a policy edit, no redeploy. If an exchange fails, the reason
+revoking access is a policy edit, no redeploy. If an `env` delivery exchange fails, the reason
 is recorded in the `wif_exchange_error` log field and the notebook starts
 without federated credentials rather than failing to launch.
 
@@ -117,9 +119,9 @@ accessible.
 
 ## What the notebook receives
 
-Before the kernel starts, the sandbox gets the temporary credentials as
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` — the
-standard variables every AWS SDK (and S3-compatible client) reads.
+With the default `env` delivery, the hub injects temporary credentials before the
+kernel starts: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN`. AWS SDKs and S3-compatible clients read these variables.
 
 Optionally, set `MARIMOHUB_WIF_STORAGE_ENDPOINT` / `MARIMOHUB_WIF_STORAGE_REGION`
 to also inject `AWS_ENDPOINT_URL_S3` / `AWS_REGION` (S3-scoped — never the
@@ -127,23 +129,49 @@ generic `AWS_ENDPOINT_URL`). Then a plain `boto3.client("s3")` reaches the
 store, at the cost of making it the default S3 endpoint/region for the whole
 notebook.
 
-::: warning Credentials expire (~1h)
-They are minted once per session and **not refreshed** — after ~1 hour they
-expire. Restart the session to renew.
+::: warning Credentials expire (~1h) unless delivered by endpoint
+With the default `MARIMOHUB_WIF_CREDENTIALS_DELIVERY=env`, they are minted once
+per session and **not refreshed** — after ~1 hour they expire. Restart the
+session to renew, or use [refreshable credentials](#refreshable-credentials).
 :::
+
+## Refreshable credentials
+
+Set `MARIMOHUB_WIF_CREDENTIALS_DELIVERY=endpoint` and configure
+`MARIMOHUB_APP_BASE_URL` with the public HTTPS URL that sandboxes can reach.
+The URL must not contain credentials, query parameters, or a fragment.
+
+The hub injects `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`. AWS SDKs and the CLI use the
+[container credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html)
+to fetch credentials from `/api/wif/v1/credentials` and refresh them before expiry.
+
+Each hub replica caches exchanged credentials in process memory to reuse them across SDK requests.
+The hub does not persist these credentials. Cache cleanup occurs during later credential requests,
+so entries can remain in memory after expiry.
+
+- **Session limit:** seven days, or an earlier authorization deadline. Active
+  connections and lifetime extensions cannot extend this limit; start a new session.
+- **Revocation:** the endpoint rejects ended sessions, suspended owners, and
+  projects that disable federation. Previously issued cloud credentials remain valid until expiry.
+- **Broker expiry:** missing, invalid, or expired credentials return HTTP 503.
+  Prefer lifetimes above 20 minutes to avoid frequent SDK refresh requests.
+- **Failures:** exchange occurs on first use, so policy failures surface as SDK errors.
+- **Compatibility:** jobs retain one-shot delivery. Clients that require static
+  `AWS_*` keys must use `env` delivery.
 
 ## Choosing a CoreWeave option
 
 Choose one method to provide CAIOS credentials to a notebook:
 
-|              | Automatic (sandbox-native)         | [Pod Identity](#example-coreweave-object-storage-pod-identity) | Manual (hub-minted)                 |
-| ------------ | ---------------------------------- | -------------------------------------------------------------- | ----------------------------------- |
-| Requires     | `coreweave` backend                | your own CKS cluster + runner                                  | any backend                         |
-| Provided by  | a Sandbox Gateway sidecar          | the CKS Pod Identity Webhook                                   | the hub, per session                |
-| Credentials  | refresh for the sandbox lifetime   | refresh for the pod lifetime                                   | expire after approximately one hour |
-| Scope        | one bucket list per deployment     | one ServiceAccount per profile                                 | one identity per project            |
-| Trust anchor | `oidc.cwsandbox.com` (CoreWeave's) | your cluster's OIDC issuer                                     | the hub itself                      |
-| Hub setup    | bucket list variable               | endpoint and region variables                                  | signing key and `MARIMOHUB_WIF_*`   |
+|              | Automatic (sandbox-native)         | [Pod Identity](#example-coreweave-object-storage-pod-identity) | Manual (hub-minted)                                    |
+| ------------ | ---------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------ |
+| Requires     | `coreweave` backend                | your own CKS cluster + runner                                  | any backend                                            |
+| Provided by  | a Sandbox Gateway sidecar          | the CKS Pod Identity Webhook                                   | the hub, per session                                   |
+| Credentials  | refresh for the sandbox lifetime   | refresh for the pod lifetime                                   | refresh with endpoint delivery; otherwise expire (~1h) |
+| Scope        | one bucket list per deployment     | one ServiceAccount per profile                                 | one identity per project                               |
+| Trust anchor | `oidc.cwsandbox.com` (CoreWeave's) | your cluster's OIDC issuer                                     | the hub itself                                         |
+| Hub setup    | bucket list variable               | endpoint and region variables                                  | signing key and `MARIMOHUB_WIF_*`                      |
 
 ## Example: CoreWeave Object Storage (Automatic)
 
@@ -715,19 +743,12 @@ The analogous setup mirrors AWS:
 
 ## Security notes
 
-- **No long-lived credentials** exist anywhere — the JWT is the only thing
-  presented to the cloud, and the returned credentials are short-lived.
-- **Credentials are not refreshed mid-session** in this version: they last until
-  their expiration (~1h). Keep sessions shorter than the credential lifetime, or
-  restart the session to re-mint.
-- **A federation/policy gap is non-fatal**: if the exchange fails (e.g. the
-  project is not covered by the cloud-side policy), the notebook starts without
-  federated credentials rather than failing to launch.
-- **Key rotation** is a swap-and-restart: set the new `MARIMOHUB_WIF_SIGNING_KEY`
-  / `MARIMOHUB_WIF_KID` and restart the hub. The hub publishes a **single** key, so
-  for a brief window after the swap — until the cloud re-fetches the JWKS — new
-  exchanges signed with the new key may be rejected; those sessions just start
-  without federated credentials (non-fatal), and already-issued temporary
-  credentials keep working until they expire. Rotate during low usage.
-  (Zero-downtime rotation — publishing the new key alongside the old in a
-  multi-key JWKS, then switching the active key — is a planned enhancement.)
+- Cloud access uses short-lived broker credentials. The hub's signing key stays
+  on the server; endpoint sessions receive an HS256 token that cannot serve as a federation JWT.
+- With `env` delivery, exchange failures leave the session without WIF credentials.
+  With [endpoint delivery](#refreshable-credentials), failures surface when the SDK fetches credentials.
+- To rotate keys, replace `MARIMOHUB_WIF_SIGNING_KEY` and `MARIMOHUB_WIF_KID`, then restart the hub.
+  Start new endpoint sessions: their existing tokens use the old key.
+  Cloud exchanges can fail until providers refresh the hub's single-key JWKS.
+  Previously issued cloud credentials remain valid until expiry. Rotate during low usage.
+  Multiple-key rotation is planned.

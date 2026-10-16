@@ -15,7 +15,6 @@ import type {
 	Project,
 	ProjectId,
 	MarimoConfigContributor,
-	SessionEnv,
 	Session,
 	SessionAdmissionRecord,
 	SessionMode,
@@ -67,7 +66,6 @@ import {
 	sessionPersistsEdits,
 	buildSandboxContext,
 	effectivePersistenceMode,
-	projectSessionEnv,
 	sandboxContextPath,
 	sandboxContextFile,
 	writeSandboxContext,
@@ -87,6 +85,8 @@ import {
 	SECONDARY_SURFACE_IDS,
 	SurfaceForbiddenError,
 	workspaceSourcePolicy,
+	validateWifCredentialsUrl,
+	wifCredentialsDeadline,
 } from '@marimo-hub/core';
 import { previewAppPoolPolicy, previewIdleTimeout, PREVIEW_MAX_SESSIONS } from '../previewPolicy';
 import { checkComputeProfile } from '../computeProfile';
@@ -100,11 +100,13 @@ import {
 } from '../notifications';
 import type { ApiDeps, SandboxConfig } from '../context';
 import {
+	composeSessionEnv,
 	federatedCredentialsFor,
-	mergeSessionEnv,
 	resolveFederatedVars,
 	resolveIntegrationRender,
 } from '../sandboxEnv';
+import { federationFor } from '../federation';
+import { WIF_CREDENTIALS_PATH } from './wifCredentials';
 import {
 	assertProjectRole,
 	assertSessionAccess,
@@ -1660,6 +1662,17 @@ export async function startNotebookSession(input: {
 		? (await sessions.findReusableEditor(pid, nid, user.id, 'exclusive', true)).session
 		: undefined;
 
+	const credentialsEndpoint = federationFor(project, deps.wif, {
+		restricted: restrictedViewerCredentials,
+	})?.credentialsEndpoint
+		? {
+				url: joinUrlPath(appBaseUrl, WIF_CREDENTIALS_PATH),
+				userId: user.id,
+				expiresAt: wifCredentialsDeadline(),
+			}
+		: undefined;
+	if (credentialsEndpoint) validateWifCredentialsUrl(credentialsEndpoint.url);
+
 	let sandboxId = admission?.member.sandbox_id ?? createSandboxId();
 	const sessionId = admission?.member.session_id ?? createSessionId();
 	let warmClaim: WarmPoolClaim | undefined;
@@ -1728,6 +1741,7 @@ export async function startNotebookSession(input: {
 				workload: sessionWorkload,
 				restricted: restrictedViewerCredentials,
 				federatedCredentials,
+				credentialsEndpoint,
 				onError: (err) => {
 					observer.tag('wif_exchange_failed', true);
 					observer.tag(
@@ -1814,15 +1828,9 @@ export async function startNotebookSession(input: {
 				wifVars: resolveWifVars,
 				marimoEnv: resolveMarimoConfigEnv,
 				integrationEnv: resolveIntegrationEnv,
-			}).then(({ wifVars, marimoEnv, integrationEnv }): SessionEnv | undefined => {
-				let env: SessionEnv | undefined = wifVars ? { vars: wifVars } : undefined;
-				if (marimoEnv) env = mergeSessionEnv(env, marimoEnv);
-				// Integration values are the base; WIF and marimo configuration win collisions.
-				if (integrationEnv) {
-					env = mergeSessionEnv(projectSessionEnv(integrationEnv), env ?? {});
-				}
-				return env;
-			});
+			}).then((layers) =>
+				composeSessionEnv({ ...layers, endpointDelivery: credentialsEndpoint !== undefined }),
+			);
 			const launchStrategy = resolveLaunchStrategyForSession({
 				entryNotebookKey: launchSource.entryNotebookKey,
 				bucket: bucketHandle,
@@ -1923,7 +1931,10 @@ export async function startNotebookSession(input: {
 						mode,
 						source_version_id: sourceVersionId,
 						editor_sandbox_sharing: mode === 'edit' ? sharing : undefined,
-						authorization_expires_at: authorizationExpiresAt,
+						authorization_expires_at: earliestDeadline(
+							authorizationExpiresAt,
+							credentialsEndpoint?.expiresAt,
+						),
 					});
 				};
 				// Publish the starting record under the source-mutation lease. Once visible,

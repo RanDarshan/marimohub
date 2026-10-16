@@ -390,6 +390,15 @@ export { WorkloadIdentityIssuer } from './identity/WorkloadIdentityIssuer';
 export type { WifClaims, JwksKey } from './identity/WorkloadIdentityIssuer';
 export { s3CredsToEnv } from './identity/s3CredsEnv';
 export {
+	containerCredentialsEnv,
+	validateWifCredentialsUrl,
+	wifCredentialsDeadline,
+	mintWifCredentialsToken,
+	toContainerCredentialsResponse,
+	verifyWifCredentialsToken,
+} from './identity/containerCredentials';
+export type { WifCredentialsTokenClaims } from './identity/containerCredentials';
+export {
 	exchangeFederatedStorageCredentials,
 	exchangeFederatedStorageEnv,
 	projectSubject,

@@ -11,6 +11,7 @@ const FAKE_PEM = '-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----';
 
 const fullEnv = {
 	MARIMOHUB_WIF_SIGNING_KEY: FAKE_PEM,
+	MARIMOHUB_APP_BASE_URL: 'https://hub.example.com/',
 	MARIMOHUB_WIF_KID: 'kid-1',
 	MARIMOHUB_WIF_ISSUER_URL: 'https://hub.example.com/',
 	MARIMOHUB_WIF_AUDIENCE: 'sts.coreweave',
@@ -122,6 +123,7 @@ describe('makeWif wiring', () => {
 describe('makeWif aws broker', () => {
 	const awsEnv = {
 		MARIMOHUB_WIF_SIGNING_KEY: FAKE_PEM,
+		MARIMOHUB_APP_BASE_URL: 'https://hub.example.com/',
 		MARIMOHUB_WIF_KID: 'kid-1',
 		MARIMOHUB_WIF_ISSUER_URL: 'https://hub.example.com',
 		MARIMOHUB_WIF_AUDIENCE: 'sts.amazonaws.com',
@@ -189,5 +191,55 @@ describe('deployment federation default', () => {
 		} finally {
 			warn.mockRestore();
 		}
+	});
+});
+
+describe('makeWif credential delivery', () => {
+	it.each([undefined, '', ' \t\n ', 'env', 'ENV', ' env '])(
+		'uses one-shot env credentials for delivery %j',
+		(delivery) => {
+			expect(
+				makeWif({ ...fullEnv, MARIMOHUB_WIF_CREDENTIALS_DELIVERY: delivery }).wif
+					?.credentialsEndpoint,
+			).toBeUndefined();
+		},
+	);
+
+	it.each(['endpoint', 'ENDPOINT', ' endpoint ', ' \tEndPoint\n '])(
+		'enables the refreshable endpoint for delivery %j',
+		(delivery) => {
+			const { wif } = makeWif({ ...fullEnv, MARIMOHUB_WIF_CREDENTIALS_DELIVERY: delivery });
+			expect(wif?.credentialsEndpoint).toEqual({ keyMaterial: FAKE_PEM });
+		},
+	);
+
+	it.each([
+		undefined,
+		'not-a-url',
+		'http://hub.example.com',
+		'https://user:secret@hub.example.com',
+		'https://hub.example.com?query=1',
+		'https://hub.example.com/#fragment',
+	])('rejects an incompatible endpoint base URL: %s', (baseUrl) => {
+		expect(() =>
+			makeWif({
+				...fullEnv,
+				MARIMOHUB_WIF_CREDENTIALS_DELIVERY: ' ENDPOINT ',
+				MARIMOHUB_APP_BASE_URL: baseUrl,
+			}),
+		).toThrow(/MARIMOHUB_APP_BASE_URL/);
+	});
+
+	it.each(['file', ' EndpointS ', 'env endpoint'])('rejects unknown delivery %j', (delivery) => {
+		expect(() => makeWif({ ...fullEnv, MARIMOHUB_WIF_CREDENTIALS_DELIVERY: delivery })).toThrow(
+			expect.objectContaining({
+				name: 'ConfigError',
+				message: `Invalid MARIMOHUB_WIF_CREDENTIALS_DELIVERY: ${delivery} (expected env, endpoint)`,
+				opts: {
+					variable: 'MARIMOHUB_WIF_CREDENTIALS_DELIVERY',
+					docs: 'docs/workload-identity-federation.md',
+				},
+			}),
+		);
 	});
 });

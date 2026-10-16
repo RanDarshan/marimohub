@@ -1,10 +1,10 @@
-import { WorkloadIdentityIssuer } from '@marimo-hub/core';
+import { validateWifCredentialsUrl, WorkloadIdentityIssuer } from '@marimo-hub/core';
 import type { CredentialBroker, FederationTarget } from '@marimo-hub/core';
 import { AwsStsWifBroker } from '@marimo-hub/credentials-aws';
 import { CoreWeaveWifBroker } from '@marimo-hub/credentials-coreweave';
 import type { ApiDeps } from '@marimo-hub/api';
 import { usesSandboxNativeObjectStorage } from './compute';
-import { parseBool, required } from './env';
+import { parseBool, parseEnumOr, required } from './env';
 import type { Env } from './env';
 import { ConfigError } from './errors';
 
@@ -127,8 +127,27 @@ export function makeWif(env: Env): Pick<ApiDeps, 'wif'> {
 		},
 	};
 
+	const delivery = parseEnumOr(
+		env,
+		'MARIMOHUB_WIF_CREDENTIALS_DELIVERY',
+		['env', 'endpoint'],
+		'env',
+		{ docs: 'docs/workload-identity-federation.md' },
+	);
+	if (delivery === 'endpoint') {
+		try {
+			validateWifCredentialsUrl(env.MARIMOHUB_APP_BASE_URL ?? '');
+		} catch {
+			throw new ConfigError('WIF endpoint delivery requires a valid HTTPS MARIMOHUB_APP_BASE_URL', {
+				variable: 'MARIMOHUB_APP_BASE_URL',
+				remediation: 'Set the public hub URL without credentials, query parameters, or a fragment.',
+				docs: 'docs/workload-identity-federation.md',
+			});
+		}
+	}
 	return {
 		wif: {
+			...(delivery === 'endpoint' ? { credentialsEndpoint: { keyMaterial: signingKey } } : {}),
 			defaultEnabled,
 			issuer: new WorkloadIdentityIssuer(signingKey, required(env, 'MARIMOHUB_WIF_KID')),
 			// Strip any trailing slash so the token `iss` and the derived `jwks_uri`

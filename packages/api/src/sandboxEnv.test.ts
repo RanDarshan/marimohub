@@ -10,7 +10,12 @@ import type {
 import type { JobRunContext } from '@marimo-hub/core/jobs';
 import { ACTOR, makeProject, uid } from '@marimo-hub/core/testing';
 import type { MemoryBucket } from '@marimo-hub/core/testing';
-import { resolveFederatedVars, resolveIntegrationRender, resolveJobSandboxEnv } from './sandboxEnv';
+import {
+	composeSessionEnv,
+	resolveFederatedVars,
+	resolveIntegrationRender,
+	resolveJobSandboxEnv,
+} from './sandboxEnv';
 import { createInitializedBucket, makeTestDeps, makeTestWif } from './testing';
 import type { ApiDeps } from './context';
 
@@ -254,6 +259,14 @@ describe('resolveJobSandboxEnv', () => {
 		expect(await resolveJobSandboxEnv(deps, context())).toBeUndefined();
 	});
 
+	it('keeps one-shot env credentials for jobs in endpoint mode', async () => {
+		const exchange = vi.fn(async () => ({ accessKeyId: 'AK', secretAccessKey: 'SK' }));
+		const config = makeTestWif({ exchange, credentialsEndpoint: true });
+		const env = await resolveJobSandboxEnv({ ...deps, wif: config }, context());
+		expect(env?.vars?.AWS_ACCESS_KEY_ID).toBe('AK');
+		expect(env?.vars).not.toHaveProperty('AWS_CONTAINER_CREDENTIALS_FULL_URI');
+	});
+
 	it('layers federated vars over the integration render', async () => {
 		const { config } = wif();
 		const { service } = integrations({
@@ -488,4 +501,80 @@ describe('package registry federation', () => {
 			expect(exchange).not.toHaveBeenCalled();
 		},
 	);
+});
+
+describe('composeSessionEnv', () => {
+	const integrationEnv: SessionRender = {
+		files: [],
+		vars: {
+			AWS_ACCESS_KEY_ID: 'integration',
+			AWS_SECRET_ACCESS_KEY: 'isk',
+			AWS_REGION: 'us-east-1',
+		},
+		attachments: [],
+		warnings: [],
+	};
+
+	it('lets one-shot WIF keys override integration keys', () => {
+		const env = composeSessionEnv({
+			wifVars: { AWS_ACCESS_KEY_ID: 'wif', AWS_SECRET_ACCESS_KEY: 'wsk' },
+			integrationEnv,
+		});
+		expect(env?.vars).toMatchObject({ AWS_ACCESS_KEY_ID: 'wif', AWS_SECRET_ACCESS_KEY: 'wsk' });
+	});
+
+	it('drops integration static keys under endpoint delivery', () => {
+		const env = composeSessionEnv({
+			endpointDelivery: true,
+			wifVars: {
+				AWS_CONTAINER_CREDENTIALS_FULL_URI: 'https://hub.example.com/api/wif/v1/credentials',
+				AWS_CONTAINER_AUTHORIZATION_TOKEN: 'tok',
+			},
+			integrationEnv: {
+				...integrationEnv,
+				vars: { ...integrationEnv.vars, AWS_SESSION_TOKEN: 'ist' },
+			},
+		});
+		expect(env?.vars).not.toHaveProperty('AWS_ACCESS_KEY_ID');
+		expect(env?.vars).not.toHaveProperty('AWS_SECRET_ACCESS_KEY');
+		expect(env?.vars).not.toHaveProperty('AWS_SESSION_TOKEN');
+		expect(env?.vars).toMatchObject({
+			AWS_CONTAINER_AUTHORIZATION_TOKEN: 'tok',
+			AWS_REGION: 'us-east-1',
+		});
+	});
+
+	it.each([undefined, {}])('drops static keys when endpoint resolution yields %j', (wifVars) => {
+		const staticKeys = {
+			AWS_ACCESS_KEY_ID: 'ak',
+			AWS_SECRET_ACCESS_KEY: 'sk',
+			AWS_SESSION_TOKEN: 'token',
+		};
+		const env = composeSessionEnv({
+			endpointDelivery: true,
+			wifVars,
+			integrationEnv,
+			marimoEnv: {
+				vars: { ...staticKeys, KEEP: 'value' },
+				defaults: { ...staticKeys, OTHER: 'default' },
+			},
+		});
+		for (const key of Object.keys(staticKeys)) {
+			expect(env?.vars).not.toHaveProperty(key);
+			expect(env?.defaults).not.toHaveProperty(key);
+		}
+		expect(env?.vars).toEqual({ AWS_REGION: 'us-east-1', KEEP: 'value' });
+		expect(env?.defaults).toEqual({ OTHER: 'default' });
+		expect(integrationEnv.vars.AWS_ACCESS_KEY_ID).toBe('integration');
+	});
+
+	it('returns no environment when endpoint resolution fails without other layers', () => {
+		expect(composeSessionEnv({ endpointDelivery: true })).toBeUndefined();
+	});
+
+	it('leaves integration keys alone without WIF', () => {
+		expect(composeSessionEnv({ integrationEnv })?.vars).toMatchObject({
+			AWS_ACCESS_KEY_ID: 'integration',
+		});
+	});
 });

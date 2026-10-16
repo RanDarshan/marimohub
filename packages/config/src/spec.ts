@@ -2049,6 +2049,20 @@ export const CONFIG_SPEC: ConfigGroup[] = [
 					},
 				],
 			},
+			{
+				name: 'Credential delivery',
+				vars: [
+					{
+						id: 'MARIMOHUB_WIF_CREDENTIALS_DELIVERY',
+						name: 'Credential delivery',
+						description:
+							'`env`: static AWS credentials (~1h). `endpoint`: SDK-managed refresh, with a seven-day session limit. Requires HTTPS `MARIMOHUB_APP_BASE_URL` and a valid broker expiry. Jobs always use `env`.',
+						optIn: true,
+						default: 'env',
+						example: 'endpoint',
+					},
+				],
+			},
 		],
 	},
 	{
