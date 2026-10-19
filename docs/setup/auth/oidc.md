@@ -40,7 +40,7 @@ must use HTTPS and cannot contain embedded credentials.
 ### Groups and roles
 
 Group authorization is optional and uses exact provider group IDs. Set a JSON
-Pointer to the provider array. Then set at least one group policy:
+Pointer to the provider's group string or array. Then set at least one group policy:
 
 ```bash
 MARIMOHUB_AUTH_OIDC_GROUPS_CLAIM=/groups
@@ -82,6 +82,10 @@ reuse keeps the earliest caller credential deadline. At expiry, the lifecycle
 destroys the kernel and the proxy closes WebSockets. This teardown skips the
 final capture so that the kernel stops promptly. Periodic snapshots limit
 potential data loss.
+
+The groups claim accepts a string or an array of strings in ID tokens, UserInfo,
+and external access tokens. `"hub-users"` is equivalent to `["hub-users"]`.
+Matching is exact: no splitting, trimming, or case conversion.
 
 Missing, malformed, or oversized group data cannot satisfy the login policy.
 marimohub accepts at most 200 group IDs. It does not resolve group-overage
