@@ -1,3 +1,4 @@
+import { utf8HeadBytes } from '@marimo-hub/core/text';
 import type {
 	ObjectBrowseContext,
 	ObjectIdentity,
@@ -457,7 +458,8 @@ function truncateCell(value: string, warnings: string[]): string {
 	const bytes = new TextEncoder().encode(value);
 	if (bytes.length <= MAX_CELL_BYTES) return value;
 	warnings.push('Some values were truncated to 8 KiB.');
-	return `${new TextDecoder().decode(bytes.slice(0, MAX_CELL_BYTES))}…`;
+	// The ellipsis is additional to the content byte budget.
+	return `${utf8HeadBytes(bytes, MAX_CELL_BYTES)}…`;
 }
 
 function scalarText(value: unknown): string {

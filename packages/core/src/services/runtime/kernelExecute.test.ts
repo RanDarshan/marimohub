@@ -11,6 +11,18 @@ function sse(body: string): Response {
 	return new Response(body, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8' } });
 }
 
+function mockKernelEvents(...events: { event: string; data: unknown }[]) {
+	return vi
+		.fn()
+		.mockResolvedValue(
+			sse(
+				events
+					.map(({ event, data }) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+					.join(''),
+			),
+		);
+}
+
 function chunkedSse(chunks: string[]): Response {
 	const encoder = new TextEncoder();
 	return new Response(
@@ -168,7 +180,7 @@ describe('kernel execution', () => {
 	});
 
 	it('reports truncation and an incomplete stream', async () => {
-		const fetchImpl = vi.fn().mockResolvedValue(sse('event: stdout\ndata: {"data":"abcdef"}\n\n'));
+		const fetchImpl = mockKernelEvents({ event: 'stdout', data: { data: 'abcdef' } });
 		await expect(
 			executeInKernel(
 				'https://kernel',
@@ -178,15 +190,93 @@ describe('kernel execution', () => {
 		).resolves.toMatchObject({ completed: false, stdout: 'abc', truncated: true });
 	});
 
-	it('caps stderr and terminal output independently', async () => {
-		const fetchImpl = vi
-			.fn()
-			.mockResolvedValue(
-				sse(
-					'event: stderr\ndata: {"data":"abcdef"}\n\n' +
-						'event: done\ndata: {"success":true,"output":{"mimetype":"text/plain","data":"uvwxyz"}}\n\n',
-				),
+	it.each(['é', '€', '😀'].flatMap((character) => [2, 2.5].map((cap) => ({ character, cap }))))(
+		'caps repeated stdout appends at UTF-8 boundaries for $character with a $cap-byte budget',
+		async ({ character, cap }) => {
+			const fetchImpl = mockKernelEvents(
+				...['a', character, 'z'].map((data) => ({ event: 'stdout', data: { data } })),
+				{ event: 'done', data: { success: true } },
 			);
+			const result = await executeInKernel(
+				'https://kernel',
+				{ sessionId: 'one', code: 'print()', maxStdoutBytes: cap },
+				{ fetchImpl },
+			);
+			expect(result.stdout).toBe('az');
+			expect(result.truncated).toBe(true);
+			expect(new TextEncoder().encode(result.stdout).byteLength).toBeLessThanOrEqual(2);
+		},
+	);
+
+	it.each(['é', '€', '😀'])(
+		'keeps stderr and terminal output within byte budgets when cutting %s',
+		async (character) => {
+			const data = `a${character}tail`;
+			const fetchImpl = mockKernelEvents(
+				{ event: 'stderr', data: { data } },
+				{ event: 'done', data: { success: false, output: { mimetype: 'text/plain', data } } },
+			);
+			const result = await executeInKernel(
+				'https://kernel',
+				{
+					sessionId: 'one',
+					code: 'raise ValueError()',
+					maxStderrBytes: 2,
+					maxOutputBytes: 2,
+				},
+				{ fetchImpl },
+			);
+			expect(result).toMatchObject({
+				completed: true,
+				success: false,
+				stderr: 'a',
+				output: { data: 'a' },
+				truncated: true,
+			});
+			expect(new TextEncoder().encode(result.stderr).byteLength).toBeLessThanOrEqual(2);
+			expect(new TextEncoder().encode(String(result.output?.data)).byteLength).toBeLessThanOrEqual(
+				2,
+			);
+		},
+	);
+
+	it.each([0, 4])('handles a %s-byte cap across all output channels', async (cap) => {
+		const data = '😀';
+		const fetchImpl = mockKernelEvents(
+			{ event: 'stdout', data: { data } },
+			{ event: 'stderr', data: { data } },
+			{ event: 'done', data: { success: true, output: { mimetype: 'text/plain', data } } },
+		);
+		const result = await executeInKernel(
+			'https://kernel',
+			{
+				sessionId: 'one',
+				code: 'print()',
+				maxStdoutBytes: cap,
+				maxStderrBytes: cap,
+				maxOutputBytes: cap,
+			},
+			{ fetchImpl },
+		);
+		const expected = cap === 0 ? '' : data;
+		expect(result).toMatchObject({
+			completed: true,
+			success: true,
+			stdout: expected,
+			stderr: expected,
+			output: { data: expected },
+			truncated: cap === 0,
+		});
+	});
+
+	it('caps stderr and terminal output independently', async () => {
+		const fetchImpl = mockKernelEvents(
+			{ event: 'stderr', data: { data: 'abcdef' } },
+			{
+				event: 'done',
+				data: { success: true, output: { mimetype: 'text/plain', data: 'uvwxyz' } },
+			},
+		);
 
 		await expect(
 			executeInKernel(
