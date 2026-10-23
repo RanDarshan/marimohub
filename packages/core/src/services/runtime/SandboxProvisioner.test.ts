@@ -1178,6 +1178,125 @@ describe('SandboxProvisioner', () => {
 			expect(cmd).not.toContain('marimohub-script-requirements.txt');
 		});
 
+		it('installs agent instructions in the adapter home before starting the session', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			instance.getHomeDirectory = async () => '/home/custom';
+			const exec = instance.exec;
+			instance.exec = async (cmd, options) => {
+				if (cmd.includes('# marimohub-agent-context-install'))
+					calls.sequence.push('installAgentContext');
+				return exec(cmd, options);
+			};
+			await new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				sessionEnv: {
+					files: [{ path: '.claude/CLAUDE.md', content: 'Use polars.', relativeTo: 'home' }],
+				},
+			});
+			const payload = calls.writeFiles
+				.flat()
+				.find((file) => file.path.startsWith('/tmp/.marimohub-agent-context-'));
+			expect(payload).toBeDefined();
+			expect(JSON.parse(String(payload!.content))).toMatchObject({
+				home: '/home/custom',
+				files: [{ path: '.claude/CLAUDE.md', content: 'Use polars.' }],
+			});
+			expect(calls.startProcess).toHaveLength(1);
+			expect(calls.sequence).toEqual(['writeFiles', 'installAgentContext', 'startProcess']);
+		});
+
+		it('injects environment variables while agent HOME lookup is pending', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const home = deferred<string>();
+			instance.getHomeDirectory = () => home.promise;
+			const provision = new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				sessionEnv: {
+					vars: { TEAM_SETTING: 'value' },
+					defaults: { MARIMO_SETTING: 'default' },
+					files: [{ path: '.claude/CLAUDE.md', content: 'instructions', relativeTo: 'home' }],
+				},
+			});
+			try {
+				await vi.waitFor(() => {
+					expect(calls.setEnvVars).toContainEqual({ TEAM_SETTING: 'value' });
+					expect(calls.setEnvDefaults).toContainEqual({ MARIMO_SETTING: 'default' });
+				});
+				expect(calls.startProcess).toEqual([]);
+			} finally {
+				home.resolve('/home/appuser');
+				await provision;
+			}
+		});
+
+		it('clears the agent context environment inherited from a filesystem snapshot', async () => {
+			const { instance, calls } = makeFakeSandbox();
+			const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
+			await provisioner.provision({
+				sandboxId,
+				projectId,
+				notebookId,
+				hostname: 'localhost',
+				bucket: bucketConfig,
+				restoreFilesystemSnapshotId: 'previous',
+			});
+			expect(calls.setEnvVars).toContainEqual({ MARIMOHUB_AGENT_CONTEXT_DIR: '' });
+		});
+
+		it.each(['home lookup', 'manifest read', 'cleanup', 'file write'] as const)(
+			'does not start a session when agent context %s fails',
+			async (failure) => {
+				const { instance, calls } = makeFakeSandbox();
+				instance.getHomeDirectory = async () => {
+					if (failure === 'home lookup') throw new Error('home unavailable');
+					return '/home/appuser';
+				};
+				const exec = instance.exec;
+				instance.exec = async (cmd, options) =>
+					(failure === 'cleanup' || failure === 'manifest read') &&
+					cmd.includes('# marimohub-agent-context-install')
+						? {
+								success: false,
+								stdout: failure === 'manifest read' ? 'invalid_manifest' : 'io_error',
+								stderr: '',
+								error: { code: 'COMMAND_FAILED' },
+							}
+						: exec(cmd, options);
+				const write = instance.writeFiles;
+				instance.writeFiles = async (files) => {
+					if (
+						failure === 'file write' &&
+						files.some((file) => file.path.startsWith('/tmp/.marimohub-agent-context-'))
+					)
+						throw new Error('disk full');
+					await write(files);
+				};
+				await expect(
+					new SandboxProvisioner(fakeComputeFrom(instance)).provision({
+						sandboxId,
+						projectId,
+						notebookId,
+						hostname: 'localhost',
+						bucket: bucketConfig,
+						restoreFilesystemSnapshotId: 'previous',
+						sessionEnv: {
+							files: [{ path: '.claude/CLAUDE.md', content: 'instructions', relativeTo: 'home' }],
+						},
+					}),
+				).rejects.toThrow('injecting session credentials');
+				expect(calls.startProcess).toEqual([]);
+				expect(calls.destroy).toBe(1);
+			},
+		);
+
 		it('accepts sessionEnv as a promise, injecting it once resolved', async () => {
 			const { instance, calls } = makeFakeSandbox();
 			const provisioner = new SandboxProvisioner(fakeComputeFrom(instance));
@@ -3602,7 +3721,10 @@ describe('SandboxProvisioner', () => {
 			const provisioner = new SandboxProvisioner(compute);
 			const start = instance.startProcess;
 			vi.spyOn(instance, 'startProcess').mockImplementation(async (...args) => {
-				expect(calls.setEnvVars).toContainEqual({ MARIMOHUB_CONTEXT_FILE: contextFile });
+				expect(calls.setEnvVars).toContainEqual({
+					MARIMOHUB_CONTEXT_FILE: contextFile,
+					MARIMOHUB_AGENT_CONTEXT_DIR: '',
+				});
 				expect(contextFile).not.toBe(oldPath);
 				expectFileResult(await instance.readFile(contextFile), {
 					success: false,
