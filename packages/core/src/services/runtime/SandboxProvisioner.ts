@@ -1,3 +1,4 @@
+import { mergeRuntimeContributions } from './runtimeContributions';
 import { AGENT_CONTEXT_DIR_ENV } from './sandboxEnvironment';
 import type { SessionEnv } from './sandboxEnvironment';
 export type { SessionEnv } from './sandboxEnvironment';
@@ -77,6 +78,7 @@ const SETUP_COMPLETE_MARKER = /^__MARIMOHUB_SETUP__ complete (\d{1,20})$/;
 const DEFAULT_WORKDIR = '/workspace';
 
 interface SetupDiagnostics {
+	failedStep?: string;
 	stderr: string;
 	timings: Timings;
 }
@@ -119,7 +121,11 @@ function parseSetupDiagnostics(stderr: string): SetupDiagnostics {
 		timings[current.name] = Math.round(Number(next.at - current.at) / 1_000_000);
 	}
 
-	return { stderr: setupOutput.join('\n').trim(), timings };
+	return {
+		stderr: setupOutput.join('\n').trim(),
+		timings,
+		failedStep: inSetup ? markers.at(-1)?.name : undefined,
+	};
 }
 
 function setupDiagnostics(stdout: string, stderr: string): SetupDiagnostics {
@@ -152,7 +158,16 @@ function logSlowSetup(
 	);
 }
 
-function pythonEnvironmentSetupFailure(result: ExecResult): PythonEnvironmentSetupError {
+function pythonEnvironmentSetupFailure(
+	result: ExecResult,
+	failedStep?: string,
+): PythonEnvironmentSetupError {
+	const startupScript = /^startup_script_(\d+)$/.exec(failedStep ?? '');
+	if (startupScript) {
+		return new PythonEnvironmentSetupError(
+			`Startup script ${startupScript[1]} failed. Check the script before restarting the workload.`,
+		);
+	}
 	const output = `${result.stdout}\n${result.stderr}`;
 	let reason = 'uv exited unsuccessfully';
 	if (/permission denied/i.test(output)) {
@@ -1298,7 +1313,7 @@ export class SandboxProvisioner {
 					tokenPasswordFile:
 						options.kernelAuthToken !== undefined ? KERNEL_AUTH_TOKEN_FILE : undefined,
 					watch: options.marimoWatch,
-					runtimePackages: (await options.sessionEnv)?.runtimePackages,
+					...mergeRuntimeContributions(await options.sessionEnv),
 				},
 				launchStrategy,
 			),
@@ -1327,7 +1342,7 @@ export class SandboxProvisioner {
 					for (const [step, ms] of Object.entries(diagnostics.timings)) {
 						sw.timings[`setup_${step}`] = ms;
 					}
-					if (!result.success) throw pythonEnvironmentSetupFailure(result);
+					if (!result.success) throw pythonEnvironmentSetupFailure(result, diagnostics.failedStep);
 				},
 				{ launch_strategy: launchStrategy },
 			);

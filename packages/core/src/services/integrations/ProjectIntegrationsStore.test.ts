@@ -2073,10 +2073,10 @@ describe('ProjectIntegrationsStore', () => {
 		});
 	});
 
-	it('listKinds describes the default registry serializably', () => {
+	it('listKinds describes every built-in kind serializably in kind order', () => {
 		const store = new ProjectIntegrationsStore({ bucket, registry: defaultRegistry(), codec });
 		const kinds = store.listKinds();
-		expect(kinds.map((k) => k.kind).sort()).toEqual([
+		expect(kinds.map((k) => k.kind)).toEqual([
 			'agent_context',
 			'athena',
 			'aws_codeartifact',
@@ -2109,6 +2109,7 @@ describe('ProjectIntegrationsStore', () => {
 			's3',
 			'snowflake',
 			'sqlserver',
+			'startup_script',
 			'trino',
 			'wandb',
 		]);
