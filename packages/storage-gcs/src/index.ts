@@ -346,6 +346,119 @@ export class GcsStorage implements Bucket {
 			uploaded: meta.updated ? new Date(meta.updated) : new Date(),
 		};
 	}
+	async putStream(
+		key: string,
+		chunks: AsyncIterable<Uint8Array>,
+		size: number,
+		options?: BucketPutOptions,
+	): Promise<BucketObject> {
+		const params = new URLSearchParams({ name: key, uploadType: 'resumable' });
+		if (options?.onlyIfEtagMatches !== undefined)
+			params.set('ifGenerationMatch', generationParam(options.onlyIfEtagMatches));
+		else if (options?.onlyIfNotExists) params.set('ifGenerationMatch', '0');
+		const contentType = options?.httpMetadata?.contentType ?? 'application/octet-stream';
+		const start = await this.client.raw(
+			`${this.apiEndpoint}/upload/storage/v1/b/${this.bucket}/o?${params}`,
+			{
+				method: 'POST',
+				headers: {
+					...(await this.authHeaders()),
+					'Content-Type': 'application/json',
+					'X-Upload-Content-Length': String(size),
+					'X-Upload-Content-Type': contentType,
+				},
+				body: JSON.stringify({ contentType, metadata: options?.customMetadata }),
+				retry: 0,
+			},
+		);
+		if (start.status === 412)
+			throw new PreconditionFailedError(`ETag (generation) mismatch for key "${key}"`);
+		if (!start.ok) return this.failNonOk(start, 'putStream', key);
+		const location = start.headers.get('location');
+		if (!location) throw new Error('GCS did not return a resumable upload location');
+		let url: URL;
+		try {
+			url = new URL(location, this.apiEndpoint);
+		} catch (cause) {
+			throw new Error('GCS returned an invalid upload location', { cause });
+		}
+		if (url.origin !== new URL(this.apiEndpoint).origin)
+			throw new Error('GCS returned an unexpected upload origin');
+		let offset = 0;
+		let buffer = new Uint8Array(Math.min(8 * 1024 * 1024, size));
+		let used = 0;
+		const send = async (final: boolean): Promise<Response> => {
+			let stalled = 0;
+			while (true) {
+				const response = await this.client.raw(url.toString(), {
+					method: 'PUT',
+					headers: {
+						...(await this.authHeaders()),
+						'Content-Length': String(used),
+						'Content-Range': used
+							? `bytes ${offset}-${offset + used - 1}/${size}`
+							: `bytes */${size}`,
+					},
+					body: buffer.subarray(0, used),
+					retry: 0,
+					redirect: 'manual',
+				});
+				if (response.status === 412)
+					throw new PreconditionFailedError(`ETag (generation) mismatch for key "${key}"`);
+				if (final && response.ok) {
+					offset += used;
+					used = 0;
+					return response;
+				}
+				if (response.status !== 308) return this.failNonOk(response, 'putStream', key);
+				const range = response.headers.get('range');
+				const match = range?.match(/^bytes=0-(\d+)$/);
+				const persisted = range === null ? 0 : match ? Number(match[1]) + 1 : Number.NaN;
+				if (!Number.isSafeInteger(persisted) || persisted < offset || persisted > offset + used)
+					throw new Error('GCS returned an invalid upload range');
+				const accepted = persisted - offset;
+				if (accepted === 0 && ++stalled >= 3) throw new Error('GCS upload made no progress');
+				if (accepted > 0) stalled = 0;
+				buffer.copyWithin(0, accepted, used);
+				used -= accepted;
+				offset = persisted;
+				if (used === 0) {
+					if (final) throw new Error('GCS did not finalize the upload');
+					return response;
+				}
+			}
+		};
+		try {
+			for await (const chunk of chunks) {
+				let consumed = 0;
+				if (offset + used + chunk.length > size) throw new Error('Stream exceeds declared size');
+				while (consumed < chunk.length) {
+					if (used === buffer.length) {
+						await send(false);
+						buffer = new Uint8Array(buffer.length);
+					}
+					const length = Math.min(buffer.length - used, chunk.length - consumed);
+					buffer.set(chunk.subarray(consumed, consumed + length), used);
+					used += length;
+					consumed += length;
+				}
+			}
+			if (offset + used !== size) throw new Error('Stream does not match declared size');
+			const response = await send(true);
+			const meta = (await response.json()) as GcsObjectResource;
+			return {
+				key,
+				etag: meta.generation ?? '',
+				size,
+				uploaded: meta.updated ? new Date(meta.updated) : new Date(),
+			};
+		} catch (error) {
+			await this.client
+				.raw(url.toString(), { method: 'DELETE', headers: await this.authHeaders(), retry: 0 })
+				.catch(() => {});
+			throw error;
+		}
+	}
 
 	async delete(key: string | string[]): Promise<void> {
 		const keys = Array.isArray(key) ? key : [key];

@@ -11,7 +11,7 @@ import {
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, vi } from 'vitest';
 import { createNotebookId, createProjectId } from '@marimo-hub/core/ids';
 import { PreconditionFailedError } from '@marimo-hub/core/errors';
 import { makeWorkspaceService } from '@marimo-hub/core/testing/workspace-fixtures';
@@ -43,6 +43,84 @@ function makeEscapingSymlink() {
 bucketContract('FsStorage', () => new FsStorage({ root: makeRoot() }));
 
 describe('FsStorage', () => {
+	it('hashes metadata and conditional writes without buffering the existing object', async () => {
+		const root = makeRoot();
+		const bucket = new FsStorage({ root });
+		const original = await bucket.put('large.bin', new Uint8Array(1024 * 1024).fill(7));
+		const handle = await fsp.open(path.join(root, 'large.bin'));
+		const readFile = vi.spyOn(Object.getPrototypeOf(handle), 'readFile').mockImplementation(() => {
+			throw new Error('Metadata must not buffer the whole object');
+		});
+		await handle.close();
+		try {
+			expect(await bucket.head('large.bin')).toMatchObject({
+				etag: original.etag,
+				size: original.size,
+			});
+			expect((await bucket.list()).objects).toEqual([await bucket.head('large.bin')]);
+			await expect(
+				bucket.put('large.bin', 'replacement', { onlyIfEtagMatches: original.etag }),
+			).resolves.toMatchObject({ size: 11 });
+			expect(readFile).not.toHaveBeenCalled();
+		} finally {
+			readFile.mockRestore();
+		}
+		expect(await (await bucket.get('large.bin'))!.text()).toBe('replacement');
+	});
+
+	it('streams atomically and preserves the destination on source or size failure', async () => {
+		const root = makeRoot();
+		const bucket = new FsStorage({ root });
+		await bucket.put('data', 'old');
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array([1, 2]);
+					expect(await (await bucket.get('data'))!.text()).toBe('old');
+					throw new Error('source failed');
+				})(),
+				3,
+			),
+		).rejects.toThrow('source failed');
+		expect(await (await bucket.get('data'))!.text()).toBe('old');
+		expect(await fsp.readdir(path.join(root, '.tmp'))).toEqual([]);
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array([1]);
+				})(),
+				2,
+			),
+		).rejects.toThrow('declared size');
+		expect(await (await bucket.get('data'))!.text()).toBe('old');
+		expect(await fsp.readdir(path.join(root, '.tmp'))).toEqual([]);
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array([1, 2, 3]);
+				})(),
+				2,
+			),
+		).rejects.toThrow('Stream exceeds declared size');
+		expect(await (await bucket.get('data'))!.text()).toBe('old');
+		expect(await fsp.readdir(path.join(root, '.tmp'))).toEqual([]);
+		const result = await bucket.putStream(
+			'data',
+			(async function* () {
+				yield new Uint8Array([1, 2]);
+				yield new Uint8Array([3]);
+			})(),
+			3,
+		);
+		expect(result.size).toBe(3);
+		expect(new Uint8Array(await (await bucket.get('data'))!.bytes())).toEqual(
+			new Uint8Array([1, 2, 3]),
+		);
+	});
+
 	it('stores parent and nested app-link records independently and lists all index depths', async () => {
 		const bucket = new FsStorage({ root: makeRoot() });
 		const registry = '_system/deep-links/';

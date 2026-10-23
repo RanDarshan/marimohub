@@ -60,7 +60,43 @@ export interface BucketPutOptions {
 	onlyIfNotExists?: boolean;
 }
 
+export interface BucketUploadPart {
+	partNumber: number;
+	etag: string;
+}
+
+export type BucketMultipartOptions = Pick<BucketPutOptions, 'httpMetadata' | 'customMetadata'> & {
+	onlyIfEtagMatches?: never;
+	onlyIfNotExists?: never;
+};
+
+export interface BucketMultipart {
+	/** Parts survive unrelated writes to the destination and can resume across requests/processes. */
+	isolatedSessions?: true;
+	create(key: string, options?: BucketMultipartOptions): Promise<{ uploadId: string }>;
+	putPart(
+		key: string,
+		uploadId: string,
+		partNumber: number,
+		bytes: Uint8Array,
+	): Promise<BucketUploadPart>;
+	complete(key: string, uploadId: string, parts: BucketUploadPart[]): Promise<BucketObject>;
+	abort(key: string, uploadId: string): Promise<void>;
+}
+
 export interface Bucket {
+	multipart?: BucketMultipart;
+	/**
+	 * Consumes chunks incrementally and publishes only after the entire body succeeds.
+	 * `size` is the exact byte count; reject shorter or longer streams without publishing.
+	 */
+	putStream?(
+		key: string,
+		chunks: AsyncIterable<Uint8Array>,
+		size: number,
+		options?: BucketPutOptions,
+	): Promise<BucketObject>;
+
 	get(key: string): Promise<BucketObjectBody | null>;
 	head(key: string): Promise<BucketObject | null>;
 	put(key: string, value: string | Uint8Array, options?: BucketPutOptions): Promise<BucketObject>;

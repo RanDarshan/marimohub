@@ -34,6 +34,7 @@ function installFakeS3(opts: { ignoreIfMatch?: boolean } = {}) {
 	// One store per client instance so each `new S3Storage(CFG)` is isolated, even
 	// though the spy lives on the shared prototype.
 	const stores = new WeakMap<object, { map: Map<string, Stored>; n: number }>();
+	const uploads = new Map<string, Map<number, { bytes: Uint8Array; etag: string }>>();
 	const calls: { name: string; input: Record<string, unknown> }[] = [];
 	const toBytes = (v: unknown): Uint8Array =>
 		typeof v === 'string' ? new TextEncoder().encode(v) : (v as Uint8Array);
@@ -56,6 +57,42 @@ function installFakeS3(opts: { ignoreIfMatch?: boolean } = {}) {
 			const store = storeFor(this);
 
 			switch (name) {
+				case 'CreateMultipartUploadCommand': {
+					const id = crypto.randomUUID();
+					uploads.set(id, new Map());
+					return { UploadId: id };
+				}
+				case 'UploadPartCommand': {
+					const upload = uploads.get(input.UploadId);
+					if (!upload) throw namedError('NoSuchUpload');
+					const etag = crypto.randomUUID();
+					upload.set(input.PartNumber, { bytes: toBytes(input.Body), etag });
+					return { ETag: etag };
+				}
+				case 'CompleteMultipartUploadCommand': {
+					const upload = uploads.get(input.UploadId);
+					if (!upload) throw namedError('NoSuchUpload');
+					const parts = input.MultipartUpload.Parts as { PartNumber: number; ETag: string }[];
+					let previous = 0;
+					const body = Buffer.concat(
+						parts.map((part, index) => {
+							if (part.PartNumber <= previous) throw namedError('InvalidPartOrder');
+							previous = part.PartNumber;
+							const stored = upload.get(part.PartNumber);
+							if (!stored || part.ETag !== stored.etag) throw namedError('InvalidPart');
+							if (index < parts.length - 1 && stored.bytes.byteLength < 5 * 1024 * 1024)
+								throw namedError('EntityTooSmall');
+							return stored.bytes;
+						}),
+					);
+					const etag = `etag-${++store.n}`;
+					store.map.set(input.Key, { body, etag, lastModified: new Date() });
+					uploads.delete(input.UploadId);
+					return { ETag: etag };
+				}
+				case 'AbortMultipartUploadCommand':
+					uploads.delete(input.UploadId);
+					return {};
 				case 'PutObjectCommand': {
 					const existing = store.map.get(input.Key);
 					if (!opts.ignoreIfMatch && input.IfMatch !== undefined) {
@@ -191,6 +228,37 @@ describe('S3Storage command mapping', () => {
 	afterEach(() => vi.restoreAllMocks());
 
 	const puts = () => fake.calls.filter((c) => c.name === 'PutObjectCommand');
+
+	it('rejects missing uploads, invalid parts, and undersized non-final parts', async () => {
+		const bucket = new S3Storage(CFG);
+		await expect(bucket.multipart.complete('data', 'missing', [])).rejects.toThrow('NoSuchUpload');
+		const { uploadId } = await bucket.multipart.create('data');
+		const part = await bucket.multipart.putPart('data', uploadId, 1, new Uint8Array([1]));
+		await expect(
+			bucket.multipart.complete('data', uploadId, [{ ...part, etag: 'wrong' }]),
+		).rejects.toThrow('InvalidPart');
+		await expect(
+			bucket.multipart.complete('data', uploadId, [{ partNumber: 2, etag: 'part-2' }]),
+		).rejects.toThrow('InvalidPart');
+		const last = await bucket.multipart.putPart('data', uploadId, 2, new Uint8Array([2]));
+		await expect(bucket.multipart.complete('data', uploadId, [part, last])).rejects.toThrow(
+			'EntityTooSmall',
+		);
+		const largeLast = await bucket.multipart.putPart(
+			'data',
+			uploadId,
+			2,
+			new Uint8Array(5 * 1024 * 1024),
+		);
+		await expect(bucket.multipart.complete('data', uploadId, [largeLast, part])).rejects.toThrow(
+			'InvalidPartOrder',
+		);
+		await bucket.multipart.putPart('data', uploadId, 1, new Uint8Array([2]));
+		await expect(bucket.multipart.complete('data', uploadId, [part])).rejects.toThrow(
+			'InvalidPart',
+		);
+		expect(await bucket.head('data')).toBeNull();
+	});
 
 	it('maps onlyIfEtagMatches to a quoted If-Match (and no If-None-Match)', async () => {
 		const s3 = new S3Storage(CFG);

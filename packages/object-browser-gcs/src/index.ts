@@ -1,4 +1,26 @@
+import {
+	objectUploadChunks,
+	assertBucket,
+	assertObjectIdentity,
+	boundedKeySearch,
+	decodeCursor,
+	createGuardedFetch,
+	DEFAULT_OBJECT_BROWSER_LIMITS,
+	detectRasterImage,
+	encodeCursor,
+	guardObjectStream,
+	isAbortError,
+	ObjectBrowserObserver,
+	objectBrowseCapability,
+	objectBrowseHttpError,
+	previewObject,
+	readBoundedBody,
+	rasterContentType,
+	withOperationDeadline,
+} from '@marimo-hub/object-browser-commons';
+import { objectWriteAllowed, ObjectBrowseError } from '@marimo-hub/core/ports/object-browser';
 import type {
+	ObjectUploadRequest,
 	GcsObjectStoreSource,
 	ObjectBody,
 	ObjectBrowseCapability,
@@ -19,27 +41,9 @@ import type {
 	ObjectVersion,
 	ObjectVersionRequest,
 } from '@marimo-hub/core/ports/object-browser';
+
 import type { Metrics } from '@marimo-hub/core/ports/metrics';
-import { ObjectBrowseError } from '@marimo-hub/core/ports/object-browser';
-import {
-	assertBucket,
-	assertObjectIdentity,
-	boundedKeySearch,
-	decodeCursor,
-	createGuardedFetch,
-	DEFAULT_OBJECT_BROWSER_LIMITS,
-	detectRasterImage,
-	encodeCursor,
-	guardObjectStream,
-	isAbortError,
-	ObjectBrowserObserver,
-	objectBrowseCapability,
-	objectBrowseHttpError,
-	previewObject,
-	readBoundedBody,
-	rasterContentType,
-	withOperationDeadline,
-} from '@marimo-hub/object-browser-commons';
+
 import type {
 	GuardedHostResolver,
 	ObjectBrowserLimits,
@@ -101,7 +105,7 @@ export class GcsObjectBrowser implements ObjectBrowser<'gcs'> {
 	}
 
 	capability(source: GcsObjectStoreSource, context: ObjectBrowseContext): ObjectBrowseCapability {
-		return objectBrowseCapability(
+		const capability = objectBrowseCapability(
 			this.provider,
 			this.mode,
 			() => {
@@ -116,6 +120,102 @@ export class GcsObjectBrowser implements ObjectBrowser<'gcs'> {
 			},
 			mapGcsError,
 		);
+		return { ...capability, write: capability.available && objectWriteAllowed(source, context) };
+	}
+
+	async putObject(
+		source: GcsObjectStoreSource,
+		context: ObjectBrowseContext,
+		request: ObjectUploadRequest,
+	): Promise<void> {
+		if (!this.capability(source, context).write)
+			throw new ObjectBrowseError('access_denied', 'Object uploads are not enabled');
+		assertObjectIdentity(source, request);
+		const auth = new GcsAuth(source, context, this.fetchImpl, false, true);
+		const headers = await auth.headers();
+		const start = await this.request(
+			context,
+			`${API_ORIGIN}/upload/storage/v1/b/${encodeURIComponent(request.bucket)}/o?uploadType=resumable&name=${encodeURIComponent(request.key)}`,
+			{
+				method: 'POST',
+				headers: {
+					...headers,
+					'Content-Type': 'application/json',
+					'X-Upload-Content-Length': String(request.size),
+					'X-Upload-Content-Type': request.contentType,
+				},
+				body: JSON.stringify({ contentType: request.contentType }),
+				redirect: 'manual',
+			},
+		);
+		const location = start.headers.get('location') ?? '';
+		await start.body?.cancel();
+		try {
+			if (!location || new URL(location).origin !== API_ORIGIN) throw new Error('location');
+		} catch {
+			throw new ObjectBrowseError('unavailable', 'GCS returned an invalid upload location');
+		}
+		let offset = 0;
+		try {
+			for await (const bytes of objectUploadChunks(request.body, request.size)) {
+				let consumed = 0;
+				let stalled = 0;
+				while (consumed < bytes.length) {
+					if (this.options.fetchImpl)
+						await this.options.resolveHost(new URL(location).hostname, context.signal);
+					const end = offset + bytes.length - consumed;
+					const response = await this.fetchImpl(location, {
+						method: 'PUT',
+						headers: {
+							...headers,
+							'Content-Length': String(bytes.length - consumed),
+							'Content-Range': `bytes ${offset}-${end - 1}/${request.size}`,
+						},
+						body: new Uint8Array(bytes.subarray(consumed)),
+						signal: context.signal,
+						redirect: 'manual',
+					});
+					await response.body?.cancel();
+					if (end === request.size && response.ok) {
+						offset = end;
+						break;
+					}
+					if (response.status !== 308) throw mapGcsResponse(response);
+					const range = response.headers.get('range');
+					const match = range?.match(/^bytes=0-(\d+)$/);
+					const persisted = range === null ? 0 : match ? Number(match[1]) + 1 : Number.NaN;
+					if (!Number.isSafeInteger(persisted) || persisted < offset || persisted > end)
+						throw new ObjectBrowseError('unavailable', 'GCS returned an invalid upload range');
+					const accepted = persisted - offset;
+					if (accepted === 0 && ++stalled >= 3)
+						throw new ObjectBrowseError('unavailable', 'GCS upload made no progress');
+					if (accepted > 0) stalled = 0;
+					consumed += accepted;
+					offset = persisted;
+					if (offset === request.size)
+						throw new ObjectBrowseError('unavailable', 'GCS did not finalize the upload');
+				}
+			}
+			if (request.size === 0) {
+				const response = await this.request(context, location, {
+					method: 'PUT',
+					headers: { ...headers, 'Content-Length': '0', 'Content-Range': 'bytes */0' },
+					body: new Uint8Array(),
+					redirect: 'manual',
+				});
+				await response.body?.cancel();
+			}
+		} catch (error) {
+			await this.fetchImpl(location, {
+				method: 'DELETE',
+				headers,
+				signal: AbortSignal.timeout(5000),
+				redirect: 'manual',
+			})
+				.then((response) => response.body?.cancel())
+				.catch(() => {});
+			throw mapGcsError(error);
+		}
 	}
 
 	listBuckets(

@@ -111,7 +111,10 @@ export class FsStorage implements Bucket {
 		return abs;
 	}
 
-	private async readObject(key: string): Promise<{ body: Buffer; uploaded: Date } | null> {
+	private async withObject<T>(
+		key: string,
+		read: (handle: fsp.FileHandle, uploaded: Date) => Promise<T>,
+	): Promise<T | null> {
 		const filePath = this.resolvePath(key);
 		let handle: fsp.FileHandle;
 		try {
@@ -147,14 +150,17 @@ export class FsStorage implements Bucket {
 				throw err;
 			}
 			if (realStat.ino !== stat.ino || realStat.dev !== stat.dev) return null;
-			return { body: await handle.readFile(), uploaded: stat.mtime };
+			return await read(handle, stat.mtime);
 		} finally {
 			await handle.close();
 		}
 	}
 
 	async get(key: string): Promise<BucketObjectBody | null> {
-		const read = await this.readObject(key);
+		const read = await this.withObject(key, async (handle, uploaded) => ({
+			body: await handle.readFile(),
+			uploaded,
+		}));
 		if (!read) return null;
 		const { body, uploaded } = read;
 		return {
@@ -169,9 +175,15 @@ export class FsStorage implements Bucket {
 	}
 
 	async head(key: string): Promise<BucketObject | null> {
-		const read = await this.readObject(key);
-		if (!read) return null;
-		return { key, etag: sha256hex(read.body), size: read.body.length, uploaded: read.uploaded };
+		return this.withObject(key, async (handle, uploaded) => {
+			const hash = createHash('sha256');
+			let size = 0;
+			for await (const chunk of handle.createReadStream({ autoClose: false })) {
+				hash.update(chunk);
+				size += chunk.length;
+			}
+			return { key, etag: hash.digest('hex'), size, uploaded };
+		});
 	}
 
 	private withKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -200,19 +212,42 @@ export class FsStorage implements Bucket {
 		value: string | Uint8Array,
 		options?: BucketPutOptions,
 	): Promise<BucketObject> {
+		const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+		return this.putStream(
+			key,
+			(async function* () {
+				yield bytes;
+			})(),
+			bytes.length,
+			options,
+		);
+	}
+
+	async putStream(
+		key: string,
+		chunks: AsyncIterable<Uint8Array>,
+		size: number,
+		options?: BucketPutOptions,
+	): Promise<BucketObject> {
 		const filePath = this.resolvePath(key);
 		if (options?.onlyIfEtagMatches !== undefined && options?.onlyIfNotExists) {
 			throw new Error('onlyIfEtagMatches and onlyIfNotExists are mutually exclusive');
 		}
 		return this.withKeyLock(key, async () => {
 			await this.assertContainedParent(filePath);
-			const body = typeof value === 'string' ? new TextEncoder().encode(value) : value;
-			const etag = sha256hex(body);
+			const hash = createHash('sha256');
+			let written = 0;
 			const tmp = path.join(this.tmpDir, randomUUID());
 			try {
 				const handle = await fsp.open(tmp, 'wx');
 				try {
-					await handle.writeFile(body);
+					for await (const chunk of chunks) {
+						written += chunk.byteLength;
+						if (written > size) throw new Error('Stream exceeds declared size');
+						hash.update(chunk);
+						await handle.writeFile(chunk);
+					}
+					if (written !== size) throw new Error('Stream does not match declared size');
 					// Flush to disk before the rename publishes the file, so a crash
 					// can't leave a renamed-but-empty object behind.
 					await handle.sync();
@@ -232,15 +267,15 @@ export class FsStorage implements Bucket {
 						throw err;
 					}
 				} else if (options?.onlyIfEtagMatches !== undefined) {
-					const current = await this.readObject(key);
-					if (!current || sha256hex(current.body) !== options.onlyIfEtagMatches) {
+					const current = await this.head(key);
+					if (!current || current.etag !== options.onlyIfEtagMatches) {
 						throw new PreconditionFailedError(`ETag mismatch for key "${key}"`);
 					}
 					await fsp.rename(tmp, filePath);
 				} else {
 					await fsp.rename(tmp, filePath);
 				}
-				return { key, etag, size: body.length, uploaded };
+				return { key, etag: hash.digest('hex'), size, uploaded };
 			} finally {
 				// ENOENT after a successful rename (the staged file was consumed).
 				await fsp.unlink(tmp).catch(() => {});
@@ -348,15 +383,9 @@ export class FsStorage implements Bucket {
 
 		const objects: BucketObject[] = [];
 		for (const key of objectKeys) {
-			const read = await this.readObject(key);
+			const object = await this.head(key);
 			// A file deleted between the walk and this read is silently skipped.
-			if (!read) continue;
-			objects.push({
-				key,
-				etag: sha256hex(read.body),
-				size: read.body.length,
-				uploaded: read.uploaded,
-			});
+			if (object) objects.push(object);
 		}
 
 		return {

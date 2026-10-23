@@ -105,8 +105,47 @@ A storage delete can complete after an error, even if the source initially
 appears intact. Keep the destination copy until you have recovered the files;
 do not delete it to retry the move.
 
-Limits: 25 MB per file, 100 MB per workspace, and 1,000 files. Larger uploads
-are rejected with `413`; a workspace over its total budget with `429`.
+### Workspace limits
+
+| Environment variable                 | Default                     | Allowed values        |
+| ------------------------------------ | --------------------------- | --------------------- |
+| `MARIMOHUB_WORKSPACE_MAX_FILE_BYTES` | 26,214,400 bytes (25 MiB)   | 1 byte to 5 GiB       |
+| `MARIMOHUB_WORKSPACE_MAX_BYTES`      | 104,857,600 bytes (100 MiB) | Positive safe integer |
+| `MARIMOHUB_WORKSPACE_MAX_FILES`      | 1,000 files                 | Positive safe integer |
+
+The total includes source files. Directory markers do not count.
+Oversized request bodies return `413`. Resumable uploads that exceed file, total-size, or file-count limits return `429`.
+The browser reads these limits from `workspace_limits` in `/api/v1/capabilities`.
+
+Higher limits increase hub memory use and session start time.
+Single-request uploads, downloads, sandbox restore, and capture buffer whole files.
+Restore batches and prefetch budgets do not split a large file or bound its memory use.
+Git fetch, folder archive, packed sandbox archive restore, and session source-artifact limits remain fixed.
+
+### Resumable uploads
+
+Files larger than the single-request limit use 8 MiB parts, with preparation, upload, and save progress.
+That limit is the smaller of 25 MiB and the configured file limit.
+After a reload or connection failure, select the same file in the same tab.
+The browser checks its contents and sends only missing parts. Closing the tab removes local resume information.
+
+Parts can upload while an editor is active, but completion returns `409` and keeps the parts.
+Stop the editor, then select the file again.
+Completion rechecks capacity, path, and overwrite restrictions.
+Use the file editor for notebook source and `pyproject.toml`.
+
+A workspace permits 16 unfinished uploads whose declared sizes fit its configured total limit.
+Uploads expire after 24 hours. Cancellation and maintenance abort native sessions or remove staged parts.
+Retries of completed uploads return the saved result without another write.
+If completion returns `409` for an interrupted publication, check the destination before you start another upload.
+The original write can succeed even if its response is lost.
+To discard saved progress, click **Restart upload** and confirm after you check the destination.
+
+S3 and R2 workspace uploads send parts directly into a destination upload session. Saving commits the uploaded parts without another full transfer.
+Other adapters stage parts and assemble them when saving.
+Custom adapters without multipart or stream support buffer the whole file during assembly.
+Their upload limit is the smaller of 64 MiB and the configured file limit.
+See the [API reference](./api.md) for start, part, progress, complete, and cancel operations under `…/workspace/uploads`.
 
 The API exposes the same operations under
 `/api/v1/projects/{pid}/notebooks/{nid}/workspace/`, including

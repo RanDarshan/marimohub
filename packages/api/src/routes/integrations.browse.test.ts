@@ -170,8 +170,16 @@ const sandboxBrowsyKind = defineIntegration({
 	},
 });
 
+const objectWrites: { bucket: string; key: string; bytes: Uint8Array }[] = [];
 const objectBrowser: ObjectBrowser<'s3'> = {
 	provider: 's3',
+	putObject: async (_source, _context, request) => {
+		const bytes =
+			request.body instanceof Uint8Array
+				? request.body
+				: new Uint8Array(await new Response(request.body).arrayBuffer());
+		objectWrites.push({ bucket: request.bucket, key: request.key, bytes });
+	},
 	capability: (source, context) => {
 		const available =
 			source.auth.method === 'static' ||
@@ -182,6 +190,7 @@ const objectBrowser: ObjectBrowser<'s3'> = {
 			root_kind: 'bucket',
 			uri_scheme: 's3',
 			available,
+			...(source.allow_write ? { write: source.auth.method === 'static' } : {}),
 			preview: available,
 			download: available,
 			search: 'bounded-key-name',
@@ -519,13 +528,14 @@ describe('Data browser routes', () => {
 		);
 	}
 
-	async function createObjectStore(pid: string, name = 'objects') {
+	async function createObjectStore(pid: string, name = 'objects', allow_write = false) {
 		return expectOk<{ id: string }>(
 			await request('POST', `/projects/${pid}/integrations`, {
 				kind: 's3',
 				name,
 				config: {
 					bucket: 'lake',
+					allow_write,
 					auth: {
 						method: 'static',
 						access_key_id: 'access',
@@ -536,6 +546,294 @@ describe('Data browser routes', () => {
 			201,
 		);
 	}
+
+	it('requires opt-in and manager permission for object uploads and publishes once', async () => {
+		objectWrites.length = 0;
+		const pid = await createProject();
+		const disabled = await createObjectStore(pid);
+		await expectError(
+			await request('POST', `/projects/${pid}/integrations/${disabled.id}/browse/objects/uploads`, {
+				bucket: 'lake',
+				path: 'data.bin',
+				size: 3,
+			}),
+			403,
+			'FORBIDDEN',
+		);
+		const { id: integrationId, base } = await writableUploads(pid);
+		const upload = await expectOk<{ id: string }>(
+			await request('POST', base, { bucket: 'lake', path: 'data.bin', size: 3 }),
+			201,
+		);
+		const api = createTestApi({ bucket, userId: ACTOR, deps });
+		await expectOk(
+			await api.app.request(`/api/v1${base}/${upload.id}/parts/1`, {
+				method: 'PUT',
+				body: new Uint8Array([1, 2, 3]),
+				headers: { 'content-type': 'application/octet-stream' },
+			}),
+		);
+		await expectOk(await request('POST', `${base}/${upload.id}/complete`));
+		await expectOk(await request('POST', `${base}/${upload.id}/complete`));
+		expect(objectWrites).toEqual([
+			{ bucket: 'lake', key: 'data.bin', bytes: new Uint8Array([1, 2, 3]) },
+		]);
+		const events = await expectOk<
+			{ event: string; bucket?: string; key?: string; bytes?: number }[]
+		>(await request('GET', `/projects/${pid}/events`));
+		expect(events.filter((event) => event.event === 'integration.object.put')).toEqual([
+			expect.objectContaining({ bucket: 'lake', key: 'data.bin', bytes: 3 }),
+		]);
+
+		const editor = uid('upload-editor');
+		await expectOk(
+			await request('POST', `/projects/${pid}/members`, { user_id: editor, role: 'editor' }),
+			201,
+		);
+		const asEditor = createTestApi({ bucket, userId: editor, deps }).request;
+		await expectError(
+			await asEditor('POST', base, { bucket: 'lake', path: 'no.bin', size: 1 }),
+			403,
+			'FORBIDDEN',
+		);
+		expect(
+			await expectOk(
+				await asEditor('GET', `/projects/${pid}/integrations/${integrationId}/browse`),
+			),
+		).toMatchObject({ surfaces: { objects: { write: false } } });
+	});
+
+	async function writableUploads(pid: string, name = 'writable') {
+		const integration = await createObjectStore(pid, name, true);
+		return {
+			id: integration.id,
+			base: `/projects/${pid}/integrations/${integration.id}/browse/objects/uploads`,
+		};
+	}
+
+	async function expectUploadAccessDenied(
+		api: ReturnType<typeof createTestApi>,
+		url: string,
+		status: number,
+		code: string,
+	) {
+		for (const [method, suffix] of [
+			['GET', ''],
+			['PUT', '/parts/1'],
+			['POST', '/complete'],
+			['DELETE', ''],
+		]) {
+			await expectError(
+				await api.app.request(`/api/v1${url}${suffix}`, {
+					method,
+					...(method === 'PUT'
+						? { body: new Uint8Array([1]), headers: { 'content-type': 'application/octet-stream' } }
+						: {}),
+				}),
+				status,
+				code,
+			);
+		}
+	}
+
+	it('rejects cross-integration and cross-owner upload access on every operation', async () => {
+		const pid = await createProject();
+		const first = await writableUploads(pid);
+		const second = await writableUploads(pid, 'another');
+		const manager = uid('other-manager');
+		await expectOk(
+			await request('POST', `/projects/${pid}/members`, { user_id: manager, role: 'manager' }),
+			201,
+		);
+		const upload = await expectOk<{ id: string }>(
+			await request('POST', first.base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		const put = vi.spyOn(objectBrowser, 'putObject');
+		for (const [base, userId, status, code] of [
+			[second.base, ACTOR, 404, 'NOT_FOUND'],
+			[first.base, manager, 403, 'FORBIDDEN'],
+		] as const) {
+			const api = createTestApi({ bucket, userId, deps });
+			await expectUploadAccessDenied(api, `${base}/${upload.id}`, status, code);
+		}
+		expect(put).not.toHaveBeenCalled();
+	});
+
+	it('blocks an existing upload after manager permission is revoked', async () => {
+		const pid = await createProject();
+		const { base } = await writableUploads(pid);
+		const manager = uid('revoked-manager');
+		await expectOk(
+			await request('POST', `/projects/${pid}/members`, { user_id: manager, role: 'manager' }),
+			201,
+		);
+		const api = createTestApi({ bucket, userId: manager, deps });
+		const upload = await expectOk<{ id: string }>(
+			await api.request('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		await expectOk(await request('PUT', `/projects/${pid}/members/${manager}`, { role: 'editor' }));
+		const put = vi.spyOn(objectBrowser, 'putObject');
+		await expectUploadAccessDenied(api, `${base}/${upload.id}`, 403, 'FORBIDDEN');
+		expect(put).not.toHaveBeenCalled();
+	});
+
+	it('rejects stale integration revisions but still allows cancellation', async () => {
+		const pid = await createProject();
+		const { id, base } = await writableUploads(pid);
+		const upload = await expectOk<{ id: string }>(
+			await request('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		await expectOk(
+			await request('PATCH', `/projects/${pid}/integrations/${id}`, { name: 'renamed' }),
+		);
+		const put = vi.spyOn(objectBrowser, 'putObject');
+		await expectError(await request('GET', `${base}/${upload.id}`), 409, 'CONFLICT');
+		await expectError(await request('POST', `${base}/${upload.id}/complete`), 409, 'CONFLICT');
+		await expectOk(await request('DELETE', `${base}/${upload.id}`));
+		expect(put).not.toHaveBeenCalled();
+	});
+
+	it.each(['revision', 'write access'])(
+		'replays completed uploads after integration %s changes without another provider write',
+		async (change) => {
+			const pid = await createProject();
+			const { id, base } = await writableUploads(pid);
+			const upload = await expectOk<{ id: string }>(
+				await request('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+				201,
+			);
+			const result = await expectOk(await request('POST', `${base}/${upload.id}/complete`));
+			await expectOk(
+				await request('PATCH', `/projects/${pid}/integrations/${id}`, {
+					...(change === 'revision'
+						? { name: 'renamed' }
+						: {
+								config: {
+									bucket: 'lake',
+									allow_write: false,
+									auth: { method: 'static', access_key_id: 'access', secret_access_key: 'secret' },
+								},
+							}),
+				}),
+			);
+			const put = vi.spyOn(objectBrowser, 'putObject');
+			expect(await expectOk(await request('GET', `${base}/${upload.id}`))).toMatchObject({
+				status: 'complete',
+			});
+			expect(await expectOk(await request('POST', `${base}/${upload.id}/complete`))).toEqual(
+				result,
+			);
+			expect(put).not.toHaveBeenCalled();
+		},
+	);
+
+	it('requires completed receipt ownership, matching integration, and current project access', async () => {
+		const pid = await createProject();
+		const { base } = await writableUploads(pid);
+		const other = await writableUploads(pid, 'other');
+		const owner = uid('completed-upload-owner');
+		await expectOk(
+			await request('POST', `/projects/${pid}/members`, { user_id: owner, role: 'manager' }),
+			201,
+		);
+		const asOwner = createTestApi({ bucket, userId: owner, deps }).request;
+		const upload = await expectOk<{ id: string }>(
+			await asOwner('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		const result = await expectOk(await asOwner('POST', `${base}/${upload.id}/complete`));
+		const put = vi.spyOn(objectBrowser, 'putObject');
+		for (const [method, suffix] of [
+			['GET', ''],
+			['POST', '/complete'],
+		] as const) {
+			await expectError(await request(method, `${base}/${upload.id}${suffix}`), 403, 'FORBIDDEN');
+			await expectError(
+				await asOwner(method, `${other.base}/${upload.id}${suffix}`),
+				404,
+				'NOT_FOUND',
+			);
+		}
+		await expectOk(await request('PUT', `/projects/${pid}/members/${owner}`, { role: 'editor' }));
+		expect(await expectOk(await asOwner('POST', `${base}/${upload.id}/complete`))).toEqual(result);
+		await expectOk(await request('DELETE', `/projects/${pid}/members/${owner}`));
+		await expectError(await asOwner('GET', `${base}/${upload.id}`), 403, 'FORBIDDEN');
+		await expectError(await asOwner('POST', `${base}/${upload.id}/complete`), 403, 'FORBIDDEN');
+		expect(put).not.toHaveBeenCalled();
+	});
+
+	it('validates object upload keys by UTF-8 bytes and accepts the exact limit', async () => {
+		const pid = await createProject();
+		const { base } = await writableUploads(pid);
+		const error = await expectError(
+			await request('POST', base, { bucket: 'lake', path: 'é'.repeat(600), size: 0 }),
+			422,
+			'VALIDATION_ERROR',
+		);
+		expect(error.message).toContain('1,024-byte UTF-8 limit');
+		await expectOk(
+			await request('POST', base, { bucket: 'lake', path: 'é'.repeat(512), size: 0 }),
+			201,
+		);
+	});
+
+	it('allows only the upload owner with manager access to cancel after writes are disabled', async () => {
+		const pid = await createProject();
+		const { id, base } = await writableUploads(pid);
+		const owner = uid('upload-owner');
+		await expectOk(
+			await request('POST', `/projects/${pid}/members`, { user_id: owner, role: 'manager' }),
+			201,
+		);
+		const asOwner = createTestApi({ bucket, userId: owner, deps }).request;
+		const upload = await expectOk<{ id: string }>(
+			await asOwner('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		await expectOk(
+			await request('PATCH', `/projects/${pid}/integrations/${id}`, {
+				config: {
+					bucket: 'lake',
+					allow_write: false,
+					auth: { method: 'static', access_key_id: 'access', secret_access_key: 'secret' },
+				},
+			}),
+		);
+		await expectError(await asOwner('POST', `${base}/${upload.id}/complete`), 403, 'FORBIDDEN');
+		await expectError(await request('DELETE', `${base}/${upload.id}`), 403, 'FORBIDDEN');
+		await expectOk(await request('PUT', `/projects/${pid}/members/${owner}`, { role: 'editor' }));
+		await expectError(await asOwner('DELETE', `${base}/${upload.id}`), 403, 'FORBIDDEN');
+		await expectOk(await request('PUT', `/projects/${pid}/members/${owner}`, { role: 'manager' }));
+		const capability = vi.spyOn(objectBrowser, 'capability');
+		await expectOk(await asOwner('DELETE', `${base}/${upload.id}`));
+		expect(capability).not.toHaveBeenCalled();
+	});
+
+	it('does not replay a failed provider write or record a success audit', async () => {
+		const pid = await createProject();
+		const { base } = await writableUploads(pid);
+		const upload = await expectOk<{ id: string }>(
+			await request('POST', base, { bucket: 'lake', path: 'data', size: 0 }),
+			201,
+		);
+		const put = vi
+			.spyOn(objectBrowser, 'putObject')
+			.mockRejectedValue(new UnavailableError('provider offline'));
+		await expectError(
+			await request('POST', `${base}/${upload.id}/complete`),
+			503,
+			'SERVICE_UNAVAILABLE',
+		);
+		await expectError(await request('POST', `${base}/${upload.id}/complete`), 409, 'CONFLICT');
+		expect(put).toHaveBeenCalledTimes(1);
+		const events = await expectOk<{ event: string }[]>(
+			await request('GET', `/projects/${pid}/events`),
+		);
+		expect(events.filter((event) => event.event === 'integration.object.put')).toEqual([]);
+	});
 
 	it('404s when the data browser is not wired', async () => {
 		const { dataBrowser: _unused, ...withoutBrowser } = deps;

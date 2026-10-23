@@ -178,6 +178,16 @@ These CAS-managed records also have one writer each:
   and only after fencing its receipt to `publishing`.
   Receipts are retained 7 days past import expiry for reconciliation and late-attempt
   cleanup; then maintenance deletes the whole import prefix.
+- `ResumableUploads`, scoped by `NotebookWorkspaceService` or the object-upload routes,
+  owns upload receipts and the reservation index at
+  `projects/{pid}/notebooks/{nid}/uploads/{id}.json`, `.../uploads/index.json`,
+  and `projects/{pid}/object-uploads/{id}.json`, `.../object-uploads/index.json`.
+  Staged parts under `{id}/parts/{n}`, relative to each upload prefix, are immutable.
+  Direct workspace uploads on S3 and R2 reserve each part checksum by CAS before
+  sending bytes to an isolated multipart session. Other backends use staged parts.
+  Publication is fenced by CAS;
+  an uncertain publication is never replayed. Maintenance retains receipts for
+  seven days past expiry to clean up late parts and native multipart uploads.
 - `NotebookWorkspaceService` owns each short-lived workspace mutation claim at
   `projects/{pid}/notebooks/{nid}/workspace_mutation_claim.json`.
 - `JobsService` owns each job definition head at

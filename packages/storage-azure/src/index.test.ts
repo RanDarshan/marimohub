@@ -31,6 +31,7 @@ function makeFakeContainer(
 	options: { ignoreConditions?: boolean; allowStaleMatches?: boolean } = {},
 ) {
 	const store = new Map<string, StoredBlob>();
+	const staged = new Map<string, Uint8Array>();
 	const calls = {
 		uploads: [] as UploadCall[],
 		deletes: [] as string[],
@@ -125,6 +126,18 @@ function makeFakeContainer(
 		},
 		getBlockBlobClient(key: string) {
 			return {
+				async stageBlock(id: string, bytes: Uint8Array) {
+					staged.set(`${key}:${id}`, bytes);
+				},
+				async commitBlockList(ids: string[], options?: UploadCall['options']) {
+					store.set(key, {
+						body: Buffer.concat(ids.map((id) => staged.get(`${key}:${id}`)!)),
+						contentType: options?.blobHTTPHeaders?.blobContentType,
+						metadata: options?.metadata,
+						etag: `"etag-${++etag}"`,
+						uploaded: new Date(),
+					});
+				},
 				async uploadData(
 					body: Uint8Array,
 					uploadOptions?: UploadCall['options'],
@@ -219,6 +232,21 @@ describe('AzureStorage construction', () => {
 });
 
 describe('AzureStorage request mapping', () => {
+	it('preserves multipart content type and custom metadata', async () => {
+		const fake = makeFakeContainer();
+		const bucket = new AzureStorage({ containerClient: fake.client });
+		const { uploadId } = await bucket.multipart.create('data', {
+			httpMetadata: { contentType: 'text/plain' },
+			customMetadata: { owner: 'test' },
+		});
+		const part = await bucket.multipart.putPart('data', uploadId, 1, new Uint8Array([42]));
+		await bucket.multipart.complete('data', uploadId, [part]);
+		expect(fake.store.get('data')).toMatchObject({
+			contentType: 'text/plain',
+			metadata: { owner: 'test' },
+		});
+	});
+
 	it('maps conditional writes, content type, and metadata', async () => {
 		const fake = makeFakeContainer();
 		const bucket = new AzureStorage({ containerClient: fake.client });

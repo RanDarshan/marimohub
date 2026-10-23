@@ -1,6 +1,7 @@
 import { PreconditionFailedError } from '@marimo-hub/core/errors';
 import { assertValidBucketListLimit } from '@marimo-hub/core/ports/bucket';
 import type {
+	BucketMultipart,
 	Bucket,
 	BucketListOptions,
 	BucketListResult,
@@ -29,6 +30,31 @@ function toObjectBody(r2obj: R2ObjectBody): BucketObjectBody {
 
 export class R2BucketAdapter implements Bucket {
 	constructor(private r2: R2Bucket) {}
+
+	readonly multipart: BucketMultipart = {
+		isolatedSessions: true,
+		create: async (key, options) => {
+			if (options?.onlyIfEtagMatches !== undefined || options?.onlyIfNotExists)
+				throw new Error('Multipart conditional writes are not supported');
+			const upload = await this.r2.createMultipartUpload(key, {
+				httpMetadata: options?.httpMetadata,
+				customMetadata: options?.customMetadata,
+			});
+			return { uploadId: upload.uploadId };
+		},
+		putPart: (key, uploadId, partNumber, bytes) =>
+			this.r2.resumeMultipartUpload(key, uploadId).uploadPart(partNumber, bytes),
+		complete: async (key, uploadId, parts) =>
+			toObject(await this.r2.resumeMultipartUpload(key, uploadId).complete(parts)),
+		abort: async (key, uploadId) => {
+			try {
+				await this.r2.resumeMultipartUpload(key, uploadId).abort();
+			} catch (error) {
+				// Workers exposes the R2 NoSuchUpload code in the error message.
+				if (!(error instanceof Error && error.message.endsWith('(10024)'))) throw error;
+			}
+		},
+	};
 
 	async get(key: string): Promise<BucketObjectBody | null> {
 		const obj = await this.r2.get(key);

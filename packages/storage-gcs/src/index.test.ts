@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PreconditionFailedError } from '@marimo-hub/core/errors';
 
 const joseMock = vi.hoisted(() => ({
 	importPKCS8: vi.fn(),
@@ -100,6 +101,8 @@ function makeFakeGcsFetch(): typeof fetch {
 			if (typeof b === 'string') return new TextEncoder().encode(b);
 			return new Uint8Array(0);
 		};
+		if (url.pathname === '/upload/session' && method === 'DELETE')
+			return new Response(null, { status: 204 });
 
 		// Upload (media or multipart): POST /upload/.../o?name=KEY[&ifGenerationMatch=G]
 		if (isUpload && method === 'POST') {
@@ -111,6 +114,10 @@ function makeFakeGcsFetch(): typeof fetch {
 				const have = existing?.generation ?? 0;
 				if (want !== have) return new Response('precondition failed', { status: 412 });
 			}
+			if (q.get('uploadType') === 'resumable')
+				return new Response(null, {
+					headers: { location: `${url.origin}/upload/session` },
+				});
 			// Extract the body (multipart wraps the media between the second blank line
 			// and the closing boundary; media is the raw body) — all at the byte level
 			// so binary payloads survive.
@@ -649,3 +656,266 @@ if (liveBucket) {
 		it('set MARIMOHUB_TEST_GCS_BUCKET to run against real GCS / an emulator', () => {});
 	});
 }
+
+describe('GCS streaming upload', () => {
+	it('normalizes a malformed resumable upload location', async () => {
+		const fetchImpl = vi.fn<typeof fetch>(
+			async () => new Response(null, { headers: { location: 'http://[' } }),
+		);
+		const bucket = new GcsStorage({ bucket: 'lake', accessToken: 'token', fetchImpl });
+		await expect(bucket.putStream('data', (async function* () {})(), 0)).rejects.toMatchObject({
+			name: 'Error',
+			message: 'GCS returned an invalid upload location',
+		});
+		expect(fetchImpl).toHaveBeenCalledOnce();
+	});
+
+	it.each([0, 3])('allocates only %i bytes for a small upload', async (size) => {
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				if (init?.method === 'POST')
+					return new Response(null, {
+						headers: { location: 'https://storage.googleapis.com/upload/session' },
+					});
+				expect((init!.body as Uint8Array).buffer.byteLength).toBe(size);
+				return Response.json({ generation: '42' });
+			}) as typeof fetch,
+		});
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array(size);
+				})(),
+				size,
+			),
+		).resolves.toMatchObject({ size });
+	});
+
+	it('sends bounded resumable ranges and commits only after the source ends', async () => {
+		const ranges: string[] = [];
+		let ended = false;
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				if (init?.method === 'POST')
+					return new Response(null, {
+						headers: { location: 'https://storage.googleapis.com/upload/session' },
+					});
+				const headers = new Headers(init?.headers);
+				ranges.push(headers.get('content-range')!);
+				if (ranges.length === 1) {
+					expect((init!.body as Uint8Array).length).toBe(8 * 1024 * 1024);
+					return new Response(null, { status: 308, headers: { Range: 'bytes=0-8388607' } });
+				}
+				expect(ended).toBe(true);
+				return Response.json({ generation: '42' });
+			}) as typeof fetch,
+		});
+		const size = 8 * 1024 * 1024 + 3;
+		const result = await bucket.putStream(
+			'data',
+			(async function* () {
+				yield new Uint8Array(8 * 1024 * 1024);
+				yield new Uint8Array(3);
+				ended = true;
+			})(),
+			size,
+		);
+		expect(result).toMatchObject({ size, etag: '42' });
+		expect(ranges).toEqual([`bytes 0-8388607/${size}`, `bytes 8388608-8388610/${size}`]);
+	});
+
+	it('cancels a session without publishing a short source', async () => {
+		const methods: string[] = [];
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				methods.push(init!.method!);
+				return new Response(null, {
+					headers: { location: 'https://storage.googleapis.com/upload/session' },
+				});
+			}) as typeof fetch,
+		});
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array(2);
+				})(),
+				3,
+			),
+		).rejects.toThrow('declared size');
+		expect(methods).toEqual(['POST', 'DELETE']);
+	});
+});
+
+describe('GCS streaming failure recovery', () => {
+	it.each([500, 412])('cancels the session after a mid-stream HTTP %s', async (status) => {
+		const methods: string[] = [];
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				methods.push(init!.method!);
+				if (init?.method === 'POST')
+					return new Response(null, {
+						headers: { location: 'https://storage.googleapis.com/upload/session' },
+					});
+				return new Response(null, { status: init?.method === 'PUT' ? status : 200 });
+			}) as typeof fetch,
+		});
+		const promise = bucket.putStream(
+			'data',
+			(async function* () {
+				yield new Uint8Array(8 * 1024 * 1024);
+				yield new Uint8Array(1);
+			})(),
+			8 * 1024 * 1024 + 1,
+		);
+		if (status === 412) await expect(promise).rejects.toBeInstanceOf(PreconditionFailedError);
+		else await expect(promise).rejects.toThrow('500');
+		expect(methods).toEqual(['POST', 'PUT', 'DELETE']);
+	});
+
+	it('cancels the session when the source iterator throws', async () => {
+		const methods: string[] = [];
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				methods.push(init!.method!);
+				return new Response(null, {
+					headers: { location: 'https://storage.googleapis.com/upload/session' },
+				});
+			}) as typeof fetch,
+		});
+		const failure = new Error('source failed');
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield new Uint8Array([1]);
+					throw failure;
+				})(),
+				2,
+			),
+		).rejects.toBe(failure);
+		expect(methods).toEqual(['POST', 'DELETE']);
+	});
+
+	it('resends only unacknowledged bytes after partial 308 responses', async () => {
+		const size = 8 * 1024 * 1024 + 3;
+		const source = Uint8Array.from({ length: size }, (_, index) => index % 251);
+		const ranges: string[] = [];
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (_url, init) => {
+				if (init?.method === 'POST')
+					return new Response(null, {
+						headers: { location: 'https://storage.googleapis.com/upload/session' },
+					});
+				const range = new Headers(init?.headers).get('content-range')!;
+				ranges.push(range);
+				const [start, end] = range
+					.match(/bytes (\d+)-(\d+)/)!
+					.slice(1)
+					.map(Number);
+				expect(Buffer.from(init!.body as Uint8Array).equals(source.subarray(start, end + 1))).toBe(
+					true,
+				);
+				if (ranges.length === 1)
+					return new Response(null, { status: 308, headers: { Range: 'bytes=0-4194303' } });
+				if (ranges.length === 2)
+					return new Response(null, { status: 308, headers: { Range: 'bytes=0-8388607' } });
+				if (ranges.length === 3)
+					return new Response(null, { status: 308, headers: { Range: 'bytes=0-8388608' } });
+				return Response.json({ generation: '42' });
+			}) as typeof fetch,
+		});
+		await expect(
+			bucket.putStream(
+				'data',
+				(async function* () {
+					yield source;
+				})(),
+				size,
+			),
+		).resolves.toMatchObject({ size });
+		expect(ranges).toEqual([
+			`bytes 0-8388607/${size}`,
+			`bytes 4194304-8388607/${size}`,
+			`bytes 8388608-8388610/${size}`,
+			`bytes 8388609-8388610/${size}`,
+		]);
+	});
+
+	it.each([null, 'invalid', 'bytes=0-9999999'])(
+		'aborts unusable 308 acknowledgements (%s)',
+		async (range) => {
+			const methods: string[] = [];
+			const bucket = new GcsStorage({
+				bucket: 'lake',
+				accessToken: 'token',
+				fetchImpl: (async (_url, init) => {
+					methods.push(init!.method!);
+					if (init?.method === 'POST')
+						return new Response(null, {
+							headers: { location: 'https://storage.googleapis.com/upload/session' },
+						});
+					if (init?.method === 'DELETE') return new Response();
+					return new Response(null, {
+						status: 308,
+						headers: range === null ? {} : { Range: range },
+					});
+				}) as typeof fetch,
+			});
+			await expect(
+				bucket.putStream(
+					'data',
+					(async function* () {
+						yield new Uint8Array([1]);
+					})(),
+					1,
+				),
+			).rejects.toThrow(range === null ? 'no progress' : 'invalid upload range');
+			expect(methods.at(-1)).toBe('DELETE');
+			expect(methods.filter((method) => method === 'PUT')).toHaveLength(range === null ? 3 : 1);
+		},
+	);
+
+	it('finalizes empty streams with the zero-byte resumable range', async () => {
+		const requests: { url: string; init?: RequestInit }[] = [];
+		const bucket = new GcsStorage({
+			bucket: 'lake',
+			accessToken: 'token',
+			fetchImpl: (async (url, init) => {
+				requests.push({ url: String(url), init });
+				if (init?.method === 'POST')
+					return new Response(null, {
+						headers: { location: 'https://storage.googleapis.com/upload/session' },
+					});
+				return Response.json({ generation: '42' });
+			}) as typeof fetch,
+		});
+		await expect(
+			bucket.putStream(
+				'empty',
+				(async function* () {
+					yield new Uint8Array();
+				})(),
+				0,
+				{ onlyIfNotExists: true },
+			),
+		).resolves.toMatchObject({ size: 0 });
+		expect(requests).toHaveLength(2);
+		expect(requests[0].url).toContain('ifGenerationMatch=0');
+		expect(new Headers(requests[1].init!.headers).get('content-range')).toBe('bytes */0');
+		expect((requests[1].init!.body as Uint8Array).byteLength).toBe(0);
+	});
+});

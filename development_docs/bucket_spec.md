@@ -1684,3 +1684,49 @@ The stored session's `notebook_id` remains the internal workspace identity used 
 Session controls accept the public parent notebook ID, then resolve their workspace and pool from the stored session.
 History reads authorize against current parent labels; live operations additionally validate preview ownership and expiry.
 Runtime cleanup does not erase provenance from retained sessions or audit events.
+
+## Resumable upload records
+
+`ResumableUploads` owns records under two prefixes:
+
+| Scope            | Prefix                                    | Caller                     |
+| ---------------- | ----------------------------------------- | -------------------------- |
+| Workspace        | `projects/{pid}/notebooks/{nid}/uploads/` | `NotebookWorkspaceService` |
+| Customer objects | `projects/{pid}/object-uploads/`          | Object-upload routes       |
+
+Each prefix has a CAS `index.json` with at most 16 reservations for declared sizes and expiry times.
+The budget is the configured workspace total or 5 GiB per project for customer objects.
+Each `{id}.json` stores the destination, size, owner, expiry, part size, part references and hashes, and publication state.
+It also stores the native upload ID and completed result when available.
+Object records also bind the integration ID, bucket, and revision. API requests enforce current authorization and upload ownership.
+
+S3 and R2 workspace uploads create an isolated destination session at start.
+The upload record reserves each part checksum by CAS before forwarding bytes to the provider.
+A part appears in progress responses only after its provider receipt is saved. Retries must match its reserved checksum.
+Completion commits these receipts without storing or reading temporary part objects.
+
+Other uploads keep staged parts at `{id}/parts/{n}` with create-if-absent writes and exact-size checks.
+Retries must match the saved hash. Assembly checks each part against its saved size and hash.
+Existing staged records keep this path when the adapter gains isolated-session support.
+Completion uses CAS to transition `uploading` → `publishing` → `complete`.
+An interrupted `publishing` record never replays its write, because a later writer can change the destination.
+Workspace completion holds the mutation claim and rechecks capacity and editor state.
+
+| Assembly                  | Adapters                             |
+| ------------------------- | ------------------------------------ |
+| Direct multipart session  | S3, R2 workspace uploads             |
+| Staged `Bucket.multipart` | Azure; existing S3/R2 staged uploads |
+| `Bucket.putStream`        | FS, GCS                              |
+| Buffered, at most 64 MiB  | Other adapters                       |
+
+Azure stays staged because other writes to the same blob can discard uncommitted blocks.
+GCS, filesystem, and object-browser uploads also retain staging.
+Multipart conditional writes are unsupported. The workspace mutation claim serializes create-only checks.
+Successful publication survives cleanup failure. Completion retries and maintenance release reservations and remove parts without another write.
+
+Uploads expire after 24 hours. Completed results remain available for seven days past expiry; cancellation preserves completed receipts.
+A confirmed publication can finish after expiry. A confirmed publication does not revive a receipt already cancelled by maintenance. Notebook/import maintenance aborts known native uploads and removes staged parts.
+Records remain seven more days so later sweeps can remove parts from delayed requests.
+Azure expires uncommitted blocks through provider retention. Abort must preserve an existing committed blob.
+Hard deletion aborts known sessions before removing upload records. Failed aborts leave records for retry.
+Configure provider lifecycle cleanup for sessions whose creation response or receipt was lost.
