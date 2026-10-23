@@ -73,6 +73,8 @@ export interface ModalConfig {
 	secretNames?: string[];
 	/** Provider-side fallback, set later than marimohub's graceful idle deadline. */
 	idleFallbackMs?: number;
+	/** Cap CPU and memory at their requests; requires both on new sandboxes. */
+	limitResources?: boolean;
 }
 
 // Modal exposes stdin EOF, but no process signal API. Keep cancellation outside
@@ -103,6 +105,10 @@ const KERNEL_PORT = 2718;
 const MAX_SANDBOX_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const OWNER_TAG = 'marimohub.owner';
 const SANDBOX_ID_TAG = 'marimohub.sandbox-id';
+
+function isPositiveUint32(value: number | undefined): boolean {
+	return value !== undefined && Number.isInteger(value) && value > 0 && value <= 0xffff_ffff;
+}
 
 export function modalProfileResources(resources: ComputeResources | undefined): {
 	cpu?: number;
@@ -225,6 +231,18 @@ class ModalSandboxInstance implements SandboxInstance {
 	) {}
 
 	private async createSandbox(): Promise<Sandbox> {
+		const { cpu, memoryMiB } = this.resources;
+		// Modal truncates CPU to millicores and encodes both resources as uint32;
+		// zero omits the explicit limit and overflow can wrap it to zero.
+		const milliCpu = Math.trunc((cpu ?? 0) * 1000);
+		if (
+			this.config.limitResources &&
+			(!isPositiveUint32(milliCpu) || !isPositiveUint32(memoryMiB))
+		) {
+			throw new Error(
+				'Modal limitResources requires resources.cpu and resources.memoryBytes. CPU must truncate to 1–4,294,967,295 millicores; memory must round up to 1–4,294,967,295 MiB.',
+			);
+		}
 		const appName = this.config.appName ?? DEFAULT_APP_NAME;
 		const { app, image, secrets } = await all({
 			app: async () => this.client.apps.fromName(appName, { createIfMissing: true }),
@@ -251,6 +269,7 @@ class ModalSandboxInstance implements SandboxInstance {
 				? { idleTimeoutMs: this.config.idleFallbackMs }
 				: {}),
 			...this.resources,
+			...(this.config.limitResources ? { cpuLimit: cpu, memoryLimitMiB: memoryMiB } : {}),
 			...(secrets.length > 0 ? { secrets } : {}),
 		});
 	}
