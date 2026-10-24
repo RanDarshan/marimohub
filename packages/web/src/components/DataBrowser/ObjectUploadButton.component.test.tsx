@@ -1,8 +1,11 @@
 import { MAX_UPLOAD_BYTES } from '@marimo-hub/core/uploads';
+import { QueryClient } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiRequestError } from '@/api/client';
+import { refreshBrowseQueries } from '@/api/hooks';
+import { browseKeys } from '@/api/queryKeys';
 import { formatBytes } from '@/lib/formatBytes';
 import { resumableUpload } from '@/lib/resumableUpload';
 import { ObjectUploadButton } from './ObjectUploadButton';
@@ -12,8 +15,8 @@ const uploader = vi.mocked(resumableUpload);
 const first = new File(['first'], 'first.csv');
 const second = new File(['second'], 'second.csv');
 
-function setup(files: File[]) {
-	const onComplete = vi.fn();
+function setup(files: File[], onRefresh?: () => void) {
+	const onComplete = vi.fn(onRefresh);
 	const view = render(
 		<ObjectUploadButton
 			projectId="project"
@@ -25,6 +28,29 @@ function setup(files: File[]) {
 	);
 	fireEvent.change(screen.getByLabelText('Upload objects'), { target: { files } });
 	return { ...view, onComplete };
+}
+
+function blockUploadsUntilAbort(publishing = false) {
+	uploader.mockImplementation(
+		(_base, file, input, options) =>
+			new Promise((_resolve, reject) => {
+				if (publishing) {
+					options?.onProgress?.({
+						path: input.path,
+						phase: 'publishing',
+						loaded: file.size,
+						total: file.size,
+					});
+				}
+				options?.signal?.addEventListener(
+					'abort',
+					() => reject(new DOMException('Cancelled', 'AbortError')),
+					{
+						once: true,
+					},
+				);
+			}),
+	);
 }
 
 beforeEach(() => {
@@ -76,18 +102,7 @@ describe('ObjectUploadButton', () => {
 	});
 
 	it('cancels the active transfer and skips the remaining files', async () => {
-		uploader.mockImplementation(
-			(_base, _file, _input, options) =>
-				new Promise((_resolve, reject) => {
-					options?.signal?.addEventListener(
-						'abort',
-						() => reject(new DOMException('Cancelled', 'AbortError')),
-						{
-							once: true,
-						},
-					);
-				}),
-		);
+		blockUploadsUntilAbort();
 		const { onComplete } = setup([first, second]);
 		const signal = uploader.mock.calls[0]?.[3]?.signal;
 		await userEvent.click(screen.getByRole('button', { name: 'Cancel upload' }));
@@ -152,18 +167,7 @@ describe('ObjectUploadButton', () => {
 	});
 
 	it('aborts on unmount without starting another file or refreshing', async () => {
-		uploader.mockImplementation(
-			(_base, _file, _input, options) =>
-				new Promise((_resolve, reject) => {
-					options?.signal?.addEventListener(
-						'abort',
-						() => reject(new DOMException('Cancelled', 'AbortError')),
-						{
-							once: true,
-						},
-					);
-				}),
-		);
+		blockUploadsUntilAbort();
 		const { unmount, onComplete } = setup([first, second]);
 		const signal = uploader.mock.calls[0]?.[3]?.signal;
 		unmount();
@@ -171,4 +175,81 @@ describe('ObjectUploadButton', () => {
 		expect(uploader).toHaveBeenCalledTimes(1);
 		expect(onComplete).not.toHaveBeenCalled();
 	});
+
+	it.each(['projectId', 'integrationId', 'bucket', 'prefix'] as const)(
+		'clears failed uploads when %s changes',
+		async (field) => {
+			uploader.mockRejectedValueOnce(
+				new ApiRequestError('CONFLICT', 'Integration changed', { status: 409 }),
+			);
+			const { rerender, onComplete } = setup([first]);
+			await screen.findByRole('button', { name: 'Restart first.csv' });
+			const destination = {
+				projectId: 'project',
+				integrationId: 'integration',
+				bucket: 'bucket',
+				prefix: 'folder/',
+				[field]: 'other',
+			};
+			rerender(<ObjectUploadButton {...destination} onComplete={onComplete} />);
+			expect(screen.queryByRole('button', { name: 'Restart first.csv' })).not.toBeInTheDocument();
+			expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+			expect(uploader).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it('aborts an active batch when navigating to another folder', async () => {
+		blockUploadsUntilAbort();
+		const { rerender, onComplete } = setup([first, second]);
+		const signal = uploader.mock.calls[0]?.[3]?.signal;
+		rerender(
+			<ObjectUploadButton
+				projectId="project"
+				integrationId="integration"
+				bucket="bucket"
+				prefix="other/"
+				onComplete={onComplete}
+			/>,
+		);
+		await waitFor(() => expect(signal?.aborted).toBe(true));
+		expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled();
+		expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+		expect(uploader).toHaveBeenCalledTimes(1);
+		expect(onComplete).not.toHaveBeenCalled();
+	});
+
+	it.each(['completed file', 'uncertain publication'] as const)(
+		'refreshes the previous destination after navigating away with %s',
+		async (publication) => {
+			blockUploadsUntilAbort(publication === 'uncertain publication');
+			if (publication === 'completed file') uploader.mockResolvedValueOnce(new Response());
+			const client = new QueryClient();
+			const previousListing = browseKeys.objects('project', 'integration', 'bucket', 'folder/');
+			client.setQueryData(previousListing, { pages: [{ items: [], next_cursor: null }] });
+			const { rerender, onComplete } = setup([first, second], () => {
+				void refreshBrowseQueries(client);
+			});
+			const started = publication === 'completed file' ? 2 : 1;
+			await waitFor(() => expect(uploader).toHaveBeenCalledTimes(started));
+			const signal = uploader.mock.calls[started - 1]?.[3]?.signal;
+			const nextComplete = vi.fn();
+			rerender(
+				<ObjectUploadButton
+					projectId="project"
+					integrationId="integration"
+					bucket="bucket"
+					prefix="other/"
+					onComplete={nextComplete}
+				/>,
+			);
+			await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+			expect(client.getQueryState(previousListing)).toBeUndefined();
+			expect(signal?.aborted).toBe(true);
+			expect(nextComplete).not.toHaveBeenCalled();
+			expect(uploader).toHaveBeenCalledTimes(started);
+			expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled();
+			expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+			client.clear();
+		},
+	);
 });
