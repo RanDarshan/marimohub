@@ -183,10 +183,14 @@ export interface ContainerConfig {
 	 * pre-owner behaviour, which sees every hub's sandboxes.
 	 */
 	ownerTag?: string;
+	volumes?: string[];
+	/** Volumes to bind mount into container*/
 }
 
-type ResolvedConfig = Required<Omit<ContainerConfig, 'network' | 'ownerTag'>> &
-	Pick<ContainerConfig, 'network' | 'ownerTag'> & { engine: string };
+type ResolvedConfig = Required<Omit<ContainerConfig, 'network' | 'ownerTag' | 'volumes'>> &
+	Pick<ContainerConfig, 'network' | 'ownerTag'> & {volumes: readonly string[];
+		 											 engine: string;
+	 };
 
 export function containerResourceArgs(resources: ComputeResources = {}): string[] {
 	return [
@@ -245,6 +249,10 @@ class ContainerSandboxInstance implements SandboxInstance {
 			...[KERNEL_PORT, ...this.config.surfacePorts].flatMap((port) => [
 				'-p',
 				`${this.config.bindHost}::${port}`,
+			...this.config.volumes.flatMap((volume) => [
+				'-v',
+				volume										
+			 ]),
 			]),
 		];
 		args.push(...containerResourceArgs(this.resources));
@@ -596,6 +604,7 @@ export class ContainerCompute implements SandboxProvider {
 			network: config.network,
 			surfacePorts,
 			ownerTag: config.ownerTag || undefined,
+			volumes: config.volumes ?? [],
 		};
 	}
 

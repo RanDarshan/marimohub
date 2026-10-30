@@ -99,6 +99,42 @@ function containerOwnerTag(env: Env, key: string): string | undefined {
 	return value;
 }
 
+function parseDockerVolumes(env: Env): string[] {
+  const key = 'MARIMOHUB_COMPUTE_DOCKER_VOLUMES';
+  const entries = parseList(env[key]) ?? [];
+
+  return entries.map((entry) => {
+    const match = entry.match(/^([^:]+):([^:]+)(?::(ro|rw))?$/);
+
+    if (!match) {
+      throw new ConfigError(
+        `Invalid ${key} entry: ${JSON.stringify(entry)} (expected host-path:container-path[:ro|rw])`,
+        {
+          variable: key,
+          remediation:
+            'Use absolute paths, e.g. /home/user/data:/workspace/data. Mounts are read-write by default.',
+          docs: 'docs/configuration.md#compute',
+        },
+      );
+    }
+
+    const [, source, destination, mode] = match;
+
+    if (!source.startsWith('/') || !destination.startsWith('/')) {
+      throw new ConfigError(
+        `Invalid ${key} entry: ${JSON.stringify(entry)} (both paths must be absolute)`,
+        {
+          variable: key,
+          remediation: 'Use absolute host and container paths.',
+          docs: 'docs/configuration.md#compute',
+        },
+      );
+    }
+
+    return `${source}:${destination}:${mode ?? 'rw'}`;
+  });
+}
+
 function kubernetesIngressAnnotations(env: Env, key: string): Record<string, string> | undefined {
 	try {
 		return parseIngressAnnotations(env[key]);
@@ -542,6 +578,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
 				network: env[variables.network],
 				ownerTag: containerOwnerTag(env, variables.ownerTag),
 				surfacePorts: surfacePorts(opts?.surfaces),
+				volumes: parseDockerVolumes(env),
 			});
 		}
 		case 'e2b':
